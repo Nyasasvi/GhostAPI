@@ -18,7 +18,7 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = [".", "ghost-core", "benchmarks", "fixtures", "tools"]
 testpaths = ["tests"]
-addopts = "-q --strict-markers --import-mode=importlib"
+addopts = "-q --strict-markers --import-mode=importlib -m \"not vm\""
 markers = ["vm: needs a real disposable macOS VM (BLOCKED_VM_STORAGE); never run by make check"]
 
 [tool.mypy]

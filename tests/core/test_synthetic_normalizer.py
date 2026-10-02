@@ -107,3 +107,14 @@ def test_partial_raw_nodes_are_virtualized() -> None:
 def test_malformed_raw_capture_is_rejected(document: dict[str, Any]) -> None:
     with pytest.raises(NormalizationError):
         norm(document)
+
+
+def test_node_limit_is_a_hard_cap_including_window_roots() -> None:
+    document = {
+        "format": "synthetic-raw/1",
+        "windows": [{"wid": f"w{i}", "root": {"id": f"r{i}", "kind": "panel"}} for i in range(5)],
+    }
+    obs, handles = norm(document, max_nodes=1)
+    assert len(handles) == 1
+    assert len(obs.windows) == 1
+    assert obs.truncation.reasons == (TruncationReason.MAX_NODES,)

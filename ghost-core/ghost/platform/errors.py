@@ -28,7 +28,7 @@ class BridgeErrorCode(StrEnum):
 
 
 # Retryability for *read* operations. Mutations are never retried automatically, whatever
-# the code says (AGENTS rule 11).
+# the code says (AGENTS rule 11), so the wire body is computed per operation.
 _RETRYABLE_READ: frozenset[BridgeErrorCode] = frozenset(
     {
         BridgeErrorCode.BUSY,
@@ -65,10 +65,14 @@ class BridgeError(Exception):
     def retryable_for_reads(self) -> bool:
         return self.code in _RETRYABLE_READ
 
-    def body(self) -> BridgeErrorBody:
+    def retryable_for(self, *, mutating: bool) -> bool:
+        """Mutations are never retryable on the wire, whatever the error code."""
+        return not mutating and self.retryable_for_reads
+
+    def body(self, *, mutating: bool) -> BridgeErrorBody:
         return BridgeErrorBody(
             code=self.code,
             message=self.message,
-            retryable=self.retryable_for_reads,
+            retryable=self.retryable_for(mutating=mutating),
             detail=tuple(sorted(self.detail.items())),
         )

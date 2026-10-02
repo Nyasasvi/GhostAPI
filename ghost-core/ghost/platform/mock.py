@@ -8,6 +8,8 @@ It never touches the host's real UI. Its environment kind is SYNTHETIC.
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -91,7 +93,13 @@ class MockPlatformBridge:
         bridge_version: str = "mock-bridge/0.1",
         epoch: datetime = datetime(2026, 1, 1, tzinfo=UTC),
         disks: Mapping[str, SimulatedDisk] | None = None,
+        session_id: str | None = None,
     ) -> None:
+        if session_id is not None and not session_id.isalnum():
+            raise ValueError("session_id must be alphanumeric")
+        # Application refs are scoped to this bridge session, so handles minted by another
+        # bridge instance can never address an element here.
+        self.session_id = session_id or uuid.uuid4().hex[:8]
         self._factories = dict(apps)
         self.faults = faults or MockFaults()
         self._bridge_version = bridge_version
@@ -143,25 +151,7 @@ class MockPlatformBridge:
         self, ctx: RequestContext, application: ApplicationRef
     ) -> tuple[WindowInfo, ...]:
         self._begin(ctx, "list_windows")
-        running = self._app(application)
-        try:
-            capture = parse_raw_capture(running.app.raw_capture())
-        except NormalizationError as error:
-            raise BridgeError(BridgeErrorCode.PLATFORM_ERROR, str(error)) from error
-        return tuple(
-            WindowInfo(
-                ref=WindowRef(ref=f"win_{w.wid}"),
-                title=w.title,
-                bounds=None
-                if w.frame is None
-                else Rect(x=w.frame[0], y=w.frame[1], w=w.frame[2], h=w.frame[3]),
-                focused=w.focused,
-                main=w.main,
-                minimized=w.minimized,
-                modal=w.modal,
-            )
-            for w in capture.windows
-        )
+        return self._windows(self._app(application))
 
     def launch(self, ctx: RequestContext, launch_ref: LaunchRef) -> LaunchResult:
         def effect() -> LaunchResult:
@@ -176,7 +166,7 @@ class MockPlatformBridge:
                     BridgeErrorCode.APP_NOT_FOUND, f"unknown launch ref {launch_ref.ref}"
                 )
             disk = self._disks.setdefault(launch_ref.ref, SimulatedDisk())
-            ref = ApplicationRef(ref=f"app_{self._next('app')}")
+            ref = ApplicationRef(ref=f"app_{self.session_id}_{self._next('app')}")
             self._running[ref.ref] = _RunningApp(
                 ref=ref, launch_ref=launch_ref.ref, app=factory(disk)
             )
@@ -196,26 +186,40 @@ class MockPlatformBridge:
         if self.faults.malformed_next_capture:
             self.faults.malformed_next_capture = False
             document = {"format": "synthetic-raw/1", "windows": "not-a-list"}
-        raw_bytes = canonical_json(document).encode("utf-8")
+        try:
+            raw_bytes = canonical_json(document).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise BridgeError(
+                BridgeErrorCode.PLATFORM_ERROR, f"raw capture is not serializable: {error}"
+            ) from error
         raw_ref = self._store(SYNTHETIC_RAW_MEDIA_TYPE, raw_bytes)
         running.generation += 1
         observation_id = f"obs_{self._next('obs')}"
-        screenshot = None
-        if request.include_capture and self.faults.capture is PermissionState.GRANTED:
-            screenshot = self._synthetic_capture(document)
+        screenshot, unavailable = None, None
+        if not request.include_capture:
+            unavailable = "not requested"
+        elif self.faults.capture is not PermissionState.GRANTED:
+            unavailable = f"capture permission {self.faults.capture.value}"
+        else:
+            screenshot = self._synthetic_capture(raw_bytes)
         raw = RawObservation(
             observation_id=observation_id,
             application=running.ref,
             generation=running.generation,
             captured_at=self._now(),
             platform=self.platform,
+            environment=EnvironmentKind.SYNTHETIC,
+            request_id=ctx.request_id,
+            correlation_id=ctx.correlation_id,
             raw_capture=raw_ref,
             screenshot=screenshot,
+            screenshot_unavailable_reason=unavailable,
             bridge_version=self._bridge_version,
         )
         try:
+            # Normalize from the stored bytes, so the derivation is replayable from evidence.
             platform_obs, handles = normalize_synthetic(
-                document,
+                json.loads(raw_bytes),
                 application=running.ref,
                 generation=running.generation,
                 observation_id=observation_id,
@@ -238,7 +242,15 @@ class MockPlatformBridge:
         running = self._app(request.application)
         if self.faults.capture is not PermissionState.GRANTED:
             raise BridgeError(BridgeErrorCode.PERMISSION_DENIED, "capture not granted")
-        artifact = self._synthetic_capture(running.app.raw_capture())
+        if request.window is not None:
+            known = {w.ref for w in self._windows(running)}
+            if request.window not in known:
+                raise BridgeError(BridgeErrorCode.WINDOW_NOT_FOUND, request.window.ref)
+        try:
+            raw_bytes = canonical_json(running.app.raw_capture()).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise BridgeError(BridgeErrorCode.CAPTURE_FAILED, str(error)) from error
+        artifact = self._synthetic_capture(raw_bytes)
         return CaptureResult(
             capture_id=f"cap_{self._next('cap')}", artifact=artifact, captured_at=self._now()
         )
@@ -274,6 +286,26 @@ class MockPlatformBridge:
         del self._running[application.ref]
 
     # -- internals ----------------------------------------------------------------------
+    def _windows(self, running: _RunningApp) -> tuple[WindowInfo, ...]:
+        try:
+            capture = parse_raw_capture(running.app.raw_capture())
+        except NormalizationError as error:
+            raise BridgeError(BridgeErrorCode.PLATFORM_ERROR, str(error)) from error
+        return tuple(
+            WindowInfo(
+                ref=WindowRef(ref=f"win_{w.wid}"),
+                title=w.title,
+                bounds=None
+                if w.frame is None
+                else Rect(x=w.frame[0], y=w.frame[1], w=w.frame[2], h=w.frame[3]),
+                focused=w.focused,
+                main=w.main,
+                minimized=w.minimized,
+                modal=w.modal,
+            )
+            for w in capture.windows
+        )
+
     def _act(
         self,
         ctx: RequestContext,
@@ -369,12 +401,9 @@ class MockPlatformBridge:
         self._artifacts.setdefault(artifact_id, (media_type, data))
         return RawArtifactRef(artifact_id=artifact_id, media_type=media_type, size_bytes=len(data))
 
-    def _synthetic_capture(self, document: object) -> RawArtifactRef:
+    def _synthetic_capture(self, raw_bytes: bytes) -> RawArtifactRef:
         # Not an image: an explicit synthetic stand-in, so nobody mistakes it for a screenshot.
-        payload = {
-            "kind": "synthetic-capture/1",
-            "source_raw_sha256": sha256_hex(canonical_json(document).encode()),
-        }
+        payload = {"kind": "synthetic-capture/1", "source_raw_sha256": sha256_hex(raw_bytes)}
         return self._store(SYNTHETIC_CAPTURE_MEDIA_TYPE, canonical_json(payload).encode("utf-8"))
 
     def _next(self, prefix: str) -> str:

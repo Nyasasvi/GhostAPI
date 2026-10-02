@@ -38,7 +38,8 @@ from ghost.platform.types import (
 SYNTHETIC_RAW_FORMAT = "synthetic-raw/1"
 SYNTHETIC_RAW_MEDIA_TYPE = "application/vnd.ghost.synthetic-raw+json"
 SYNTHETIC_CAPTURE_MEDIA_TYPE = "application/vnd.ghost.synthetic-capture+json"
-SYNTHETIC_NORMALIZER = GeneratorInfo(name="synthetic-normalizer", version="1")
+# v2: max_nodes is a hard cap including window roots; focus beyond the cap is unknown.
+SYNTHETIC_NORMALIZER = GeneratorInfo(name="synthetic-normalizer", version="2")
 
 # Versioned vocabulary of the synthetic platform (part of SYNTHETIC_NORMALIZER v1).
 KIND_TO_ROLE: dict[str, Role] = {
@@ -204,12 +205,8 @@ class _Normalizer:
         self.max_nodes = max_nodes
         self.handles: dict[int, str] = {}
         self.reasons: set[TruncationReason] = set()
-        self.seen: set[str] = set()
 
     def element(self, node: RawNode, depth: int) -> UIElement:
-        if node.id in self.seen:
-            raise NormalizationError(f"duplicate raw node id {node.id!r}")
-        self.seen.add(node.id)
         index = len(self.handles)
         self.handles[index] = node.id
         truncated = node.partial
@@ -242,6 +239,18 @@ class _Normalizer:
         )
 
 
+def _all_node_ids(capture: RawCapture) -> set[str]:
+    ids: set[str] = set()
+    stack = [w.root for w in capture.windows]
+    while stack:
+        node = stack.pop()
+        if node.id in ids:
+            raise NormalizationError(f"duplicate raw node id {node.id!r}")
+        ids.add(node.id)
+        stack.extend(node.kids)
+    return ids
+
+
 def normalize_synthetic(
     document: object,
     *,
@@ -258,9 +267,13 @@ def normalize_synthetic(
     generation. Pure and deterministic: the same raw document always yields the same output.
     """
     capture = parse_raw_capture(document)
+    all_ids = _all_node_ids(capture)
     norm = _Normalizer(application, generation, max_depth, max_nodes)
     windows = []
     for raw_window in capture.windows:
+        if len(norm.handles) >= max_nodes:
+            norm.reasons.add(TruncationReason.MAX_NODES)
+            break
         root = norm.element(raw_window.root, 0)
         info = WindowInfo(
             ref=WindowRef(ref=f"win_{raw_window.wid}"),
@@ -274,10 +287,11 @@ def normalize_synthetic(
         windows.append(WindowObservation(info=info, root=root))
     focused: ElementRef | None = None
     if capture.focus is not None:
-        index = next((i for i, nid in norm.handles.items() if nid == capture.focus), None)
-        if index is None:
+        if capture.focus not in all_ids:
             raise NormalizationError(f"focus refers to unknown node {capture.focus!r}")
-        focused = ElementRef(application=application, generation=generation, index=index)
+        index = next((i for i, nid in norm.handles.items() if nid == capture.focus), None)
+        if index is not None:  # otherwise focus lies in truncated (unknown) content
+            focused = ElementRef(application=application, generation=generation, index=index)
     reasons = tuple(sorted(norm.reasons))
     observation = PlatformObservation(
         observation_id=observation_id,

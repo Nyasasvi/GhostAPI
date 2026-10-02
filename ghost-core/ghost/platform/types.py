@@ -179,6 +179,19 @@ class GeneratorInfo(StrictModel):
     version: Annotated[str, Field(min_length=1)]
 
 
+class EnvironmentKind(StrEnum):
+    """Where the bridge's target UI lives.
+
+    DISPOSABLE_VM is the only environment in which real-platform exploration and trials may
+    run (AGENTS invariant 2). SYNTHETIC is an in-process simulated UI that cannot touch the
+    host; results from it are SYNTHETIC_FIXTURE evidence and never real-platform evidence.
+    """
+
+    SYNTHETIC = "synthetic"
+    DISPOSABLE_VM = "disposable_vm"
+    UNKNOWN = "unknown"
+
+
 class RawArtifactRef(StrictModel):
     artifact_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     media_type: Annotated[str, Field(min_length=3)]
@@ -193,10 +206,20 @@ class RawObservation(StrictModel):
     generation: Annotated[int, Field(ge=0)]
     captured_at: AwareDatetime
     platform: Annotated[str, Field(min_length=1)]
+    environment: EnvironmentKind
+    request_id: Annotated[str, Field(min_length=1)]
+    correlation_id: Annotated[str, Field(min_length=1)]
     raw_capture: RawArtifactRef
     screenshot: RawArtifactRef | None = None
+    screenshot_unavailable_reason: str | None = None
     bridge_version: Annotated[str, Field(min_length=1)]
     truncation: Truncation = Truncation()
+
+    @model_validator(mode="after")
+    def _screenshot_explained(self) -> RawObservation:
+        if (self.screenshot is None) == (self.screenshot_unavailable_reason is None):
+            raise ValueError("exactly one of screenshot / screenshot_unavailable_reason is set")
+        return self
 
 
 class PlatformObservation(StrictModel):
@@ -214,6 +237,25 @@ class PlatformObservation(StrictModel):
     windows: tuple[WindowObservation, ...]
     focused: ElementRef | None = None
     truncation: Truncation = Truncation()
+
+    @model_validator(mode="after")
+    def _handles_consistent(self) -> PlatformObservation:
+        seen: set[int] = set()
+        for _, element, _ in self.walk():
+            ref = element.ref
+            if ref.application != self.application or ref.generation != self.generation:
+                raise ValueError(f"element {ref.index} belongs to another application/generation")
+            if ref.index in seen:
+                raise ValueError(f"duplicate element index {ref.index}")
+            seen.add(ref.index)
+        if self.focused is not None and self.focused.index not in seen:
+            raise ValueError("focused element is not part of the observation")
+        if self.focused is not None and (
+            self.focused.application != self.application
+            or self.focused.generation != self.generation
+        ):
+            raise ValueError("focused element belongs to another application/generation")
+        return self
 
     def walk(self) -> Iterator[tuple[WindowObservation, UIElement, int]]:
         """Depth-first (window, element, depth) in observed order."""
@@ -246,6 +288,8 @@ class ObservationBundle(StrictModel):
             raise ValueError("platform observation does not match its raw observation")
         if p.raw_capture_id != r.raw_capture.artifact_id:
             raise ValueError("platform observation was not derived from this raw capture")
+        if p.platform != r.platform:
+            raise ValueError("platform observation and raw observation name different platforms")
         return self
 
 
@@ -276,14 +320,6 @@ class ActionResult(StrictModel):
 class PermissionState(StrEnum):
     GRANTED = "granted"
     DENIED = "denied"
-    UNKNOWN = "unknown"
-
-
-class EnvironmentKind(StrEnum):
-    """Where the bridge runs. Exploration and trials require SYNTHETIC or DISPOSABLE_VM."""
-
-    SYNTHETIC = "synthetic"
-    DISPOSABLE_VM = "disposable_vm"
     UNKNOWN = "unknown"
 
 

@@ -7,6 +7,7 @@ disposable macOS VM exists; until then that entry is BLOCKED_VM_STORAGE.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from functools import partial
 
@@ -16,8 +17,13 @@ from ghost._model import sha256_hex
 from ghost.evidence import BLOCKED_VM_STORAGE
 from ghost.platform.errors import BridgeError, BridgeErrorCode
 from ghost.platform.mock import MockFaults, MockPlatformBridge
-from ghost.platform.protocol import PlatformBridge, RequestContext, retry_read
-from ghost.platform.simulated import SYNTHETIC_CAPTURE_MEDIA_TYPE
+from ghost.platform.protocol import (
+    CONTRACT_OPERATIONS,
+    PlatformBridge,
+    RequestContext,
+    RetryingReader,
+)
+from ghost.platform.simulated import SYNTHETIC_CAPTURE_MEDIA_TYPE, normalize_synthetic
 from ghost.platform.types import (
     ActionKind,
     ApplicationRef,
@@ -31,6 +37,7 @@ from ghost.platform.types import (
     StringValue,
     TruncationReason,
     UIElement,
+    WindowRef,
 )
 from tests.support.toy_app import ToyApp
 
@@ -41,8 +48,12 @@ def ctx(deadline_ms: int = 1000) -> RequestContext:
     return RequestContext.new("contract-test", deadline_ms)
 
 
-def make_mock(faults: MockFaults | None = None, rows: int = 2) -> MockPlatformBridge:
-    return MockPlatformBridge({"seed:toy": partial(ToyApp, rows=rows)}, faults=faults)
+def make_mock(
+    faults: MockFaults | None = None, rows: int = 2, session_id: str | None = None
+) -> MockPlatformBridge:
+    return MockPlatformBridge(
+        {"seed:toy": partial(ToyApp, rows=rows)}, faults=faults, session_id=session_id
+    )
 
 
 BRIDGES: dict[str, Callable[[], PlatformBridge]] = {"mock": make_mock}
@@ -56,7 +67,8 @@ def bridge(request: pytest.FixtureRequest) -> PlatformBridge:
 
 @pytest.mark.vm
 def test_macos_bridge_contract_is_blocked() -> None:
-    pytest.skip(f"{BLOCKED_VM_STORAGE}: MacOSBridge contract run needs a disposable macOS VM")
+    # Fails (never skips) so that a VM test run cannot report green while blocked.
+    pytest.fail(f"{BLOCKED_VM_STORAGE}: MacOSBridge contract run needs a disposable macOS VM")
 
 
 def launch(bridge: PlatformBridge) -> ApplicationRef:
@@ -77,6 +89,16 @@ def by_label(bundle: ObservationBundle, label: str) -> UIElement:
 
 def test_implements_protocol(bridge: PlatformBridge) -> None:
     assert isinstance(bridge, PlatformBridge)
+
+
+def test_contract_surface_is_frozen() -> None:
+    # Adding shell/filesystem/coordinate/keyboard operations must fail loudly here.
+    declared = {
+        name
+        for name in vars(PlatformBridge)
+        if not name.startswith("_") and callable(getattr(PlatformBridge, name))
+    }
+    assert declared == set(CONTRACT_OPERATIONS)
 
 
 def test_health_reports_synthetic_ready(bridge: PlatformBridge) -> None:
@@ -109,8 +131,52 @@ def test_observe_links_raw_and_platform_evidence(bridge: PlatformBridge) -> None
     raw = bridge.get_artifact(ctx(), first.raw.raw_capture.artifact_id)
     assert "sha256:" + sha256_hex(raw) == first.raw.raw_capture.artifact_id
     assert first.platform.raw_capture_id == first.raw.raw_capture.artifact_id
-    roles = {e.role for _, e, _ in first.platform.walk()}
-    assert roles <= set(Role)
+    neutral = first.platform.model_dump_json()
+    for raw_word in ('"kids"', "push_button", '"acts"', '"flags"'):
+        assert raw_word not in neutral  # platform vocabulary never crosses the boundary
+
+
+def test_normalization_is_replayable_from_stored_raw_bytes(bridge: PlatformBridge) -> None:
+    app = launch(bridge)
+    bundle = observe(bridge, app)
+    raw = bridge.get_artifact(ctx(), bundle.raw.raw_capture.artifact_id)
+    replayed, _ = normalize_synthetic(
+        json.loads(raw),
+        application=app,
+        generation=bundle.platform.generation,
+        observation_id=bundle.platform.observation_id,
+        raw_capture_id=bundle.raw.raw_capture.artifact_id,
+    )
+    assert replayed == bundle.platform
+
+
+def test_evidence_records_request_lineage(bridge: PlatformBridge) -> None:
+    app = launch(bridge)
+    call = RequestContext.new("run-7/trial-3", 1000)
+    raw = bridge.observe(call, ObserveRequest(application=app)).raw
+    assert raw.request_id == call.request_id
+    assert raw.correlation_id == "run-7/trial-3"
+    assert raw.environment.value == "synthetic"
+
+
+def test_list_applications_and_windows(bridge: PlatformBridge) -> None:
+    app = launch(bridge)
+    (info,) = bridge.list_applications(ctx())
+    assert info.application == app
+    (window,) = bridge.list_windows(ctx(), app)
+    assert window.title == "Toy"
+    with pytest.raises(BridgeError) as missing:
+        bridge.list_windows(ctx(), ApplicationRef(ref="app_nope"))
+    assert missing.value.code is BridgeErrorCode.APP_NOT_FOUND
+
+
+def test_handles_from_another_bridge_session_are_rejected() -> None:
+    first, second = make_mock(), make_mock()
+    stale_elsewhere = by_label(observe(first, launch(first)), "Increment").ref
+    launch(second)
+    with pytest.raises(BridgeError) as info:
+        second.invoke(ctx(), stale_elsewhere)
+    assert info.value.code is BridgeErrorCode.APP_NOT_FOUND
 
 
 def test_invoke_is_a_claim_and_effect_shows_in_fresh_observation(bridge: PlatformBridge) -> None:
@@ -195,12 +261,45 @@ def test_deadline_shorter_than_latency_times_out_without_effect() -> None:
     assert by_label(observe(bridge, app), "count 0")
 
 
-def test_retry_read_retries_reads_and_refuses_mutations() -> None:
+def test_reader_retries_reads_with_same_request_and_shrinking_deadline() -> None:
+    seen: list[RequestContext] = []
     bridge = make_mock(MockFaults(busy_once={"health"}))
-    call = ctx()
-    assert retry_read("health", lambda: bridge.health(call)).live
-    with pytest.raises(ValueError, match="mutating"):
-        retry_read("invoke", lambda: bridge.health(call))
+    inner_health = bridge.health
+
+    def spy(call: RequestContext) -> object:
+        seen.append(call)
+        return inner_health(call)
+
+    bridge.health = spy  # type: ignore[method-assign,assignment]
+    waits: list[int] = []
+    reader = RetryingReader(bridge, clock_ms=lambda: 0, sleep_ms=waits.append)
+    call = ctx(deadline_ms=1000)
+    assert reader.health(call).live
+    assert [c.request_id for c in seen] == [call.request_id] * 2
+    assert seen[1].deadline_ms == 1000 - 50
+    assert waits == [50]
+
+
+def test_reader_has_no_mutating_operations_and_passes_through_fatal_errors() -> None:
+    reader = RetryingReader(make_mock())
+    assert not any(hasattr(reader, op) for op in ("launch", "invoke", "set_value"))
+    with pytest.raises(BridgeError) as info:
+        reader.list_windows(ctx(), ApplicationRef(ref="app_nope"))
+    assert info.value.code is BridgeErrorCode.APP_NOT_FOUND
+
+
+def test_reader_gives_up_after_budgeted_retries() -> None:
+    bridge = make_mock(MockFaults(latency_ms={"health": 5000}))
+    reader = RetryingReader(bridge, clock_ms=lambda: 0, sleep_ms=lambda _ms: None)
+    with pytest.raises(BridgeError) as info:
+        reader.health(ctx(deadline_ms=1000))
+    assert info.value.code is BridgeErrorCode.TIMEOUT
+
+
+def test_mutation_errors_are_never_retryable_on_the_wire() -> None:
+    error = BridgeError(BridgeErrorCode.TIMEOUT, "late")
+    assert error.body(mutating=False).retryable
+    assert not error.body(mutating=True).retryable
 
 
 def test_permission_denied_blocks_observation_and_readiness() -> None:
@@ -239,6 +338,38 @@ def test_capture_is_an_explicit_synthetic_artifact(bridge: PlatformBridge) -> No
     app = launch(bridge)
     result = bridge.capture(ctx(), CaptureRequest(application=app))
     assert result.artifact.media_type == SYNTHETIC_CAPTURE_MEDIA_TYPE
+    with pytest.raises(BridgeError) as info:
+        bridge.capture(ctx(), CaptureRequest(application=app, window=WindowRef(ref="win_nope")))
+    assert info.value.code is BridgeErrorCode.WINDOW_NOT_FOUND
+
+
+def test_denied_capture_is_recorded_not_silent() -> None:
+    bridge = make_mock(MockFaults(capture=PermissionState.DENIED))
+    raw = observe(bridge, launch(bridge)).raw
+    assert raw.screenshot is None
+    assert raw.screenshot_unavailable_reason == "capture permission denied"
+
+
+def test_focus_beyond_node_limit_is_unknown_not_an_error() -> None:
+    bridge = make_mock()
+    app = launch(bridge)
+    field = by_label(observe(bridge, app), "Name")
+    bridge.set_value(ctx(), field.ref, StringValue(value="x"))  # moves focus to the field
+    small = observe(bridge, app, max_nodes=3)
+    assert small.platform.focused is None
+    assert TruncationReason.MAX_NODES in small.platform.truncation.reasons
+
+
+def test_unserializable_raw_capture_is_a_typed_error() -> None:
+    bridge = make_mock()
+    app = launch(bridge)
+    toy = next(iter(bridge._running.values())).app
+    assert isinstance(toy, ToyApp)
+    toy.text = "ok"
+    toy.raw_capture = lambda: {"format": "synthetic-raw/1", "windows": [], "bad": float("nan")}  # type: ignore[method-assign]
+    with pytest.raises(BridgeError) as info:
+        observe(bridge, app)
+    assert info.value.code is BridgeErrorCode.PLATFORM_ERROR
 
 
 def test_unknown_artifact_is_not_found(bridge: PlatformBridge) -> None:
@@ -249,7 +380,7 @@ def test_unknown_artifact_is_not_found(bridge: PlatformBridge) -> None:
 
 def test_same_operations_give_identical_evidence() -> None:
     def run() -> list[str]:
-        bridge = make_mock()
+        bridge = make_mock(session_id="fixed")
         app = launch(bridge)
         first = observe(bridge, app)
         bridge.invoke(ctx(), by_label(first, "Increment").ref)

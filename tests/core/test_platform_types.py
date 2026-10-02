@@ -96,7 +96,9 @@ def test_health_cannot_claim_ready_without_permissions() -> None:
         )
 
 
-def _platform(observation_id: str = "obs_1", raw_id: str = SHA) -> PlatformObservation:
+def _platform(
+    observation_id: str = "obs_1", raw_id: str = SHA, focused: ElementRef | None = None
+) -> PlatformObservation:
     root = UIElement(
         ref=ref(), role=Role.GROUP, children=(UIElement(ref=ref(1), role=Role.BUTTON),)
     )
@@ -109,17 +111,22 @@ def _platform(observation_id: str = "obs_1", raw_id: str = SHA) -> PlatformObser
         platform="synthetic",
         normalizer=GeneratorInfo(name="n", version="1"),
         windows=(window,),
+        focused=focused,
     )
 
 
-def _raw() -> RawObservation:
+def _raw(platform: str = "synthetic") -> RawObservation:
     return RawObservation(
         observation_id="obs_1",
         application=APP,
         generation=0,
         captured_at=datetime(2026, 1, 1, tzinfo=UTC),
-        platform="synthetic",
+        platform=platform,
+        environment=EnvironmentKind.SYNTHETIC,
+        request_id="r" * 32,
+        correlation_id="test",
         raw_capture=RawArtifactRef(artifact_id=SHA, media_type="application/json", size_bytes=1),
+        screenshot_unavailable_reason="not requested",
         bridge_version="b",
     )
 
@@ -130,6 +137,40 @@ def test_bundle_requires_platform_observation_derived_from_its_raw() -> None:
         ObservationBundle(raw=_raw(), platform=_platform(raw_id="sha256:" + "b" * 64))
     with pytest.raises(ValidationError):
         ObservationBundle(raw=_raw(), platform=_platform(observation_id="obs_2"))
+    with pytest.raises(ValidationError, match="different platforms"):
+        ObservationBundle(raw=_raw(platform="macos"), platform=_platform())
+
+
+def test_missing_screenshot_must_be_explained() -> None:
+    raw = _raw()
+    with pytest.raises(ValidationError):
+        RawObservation.model_validate(
+            {**raw.model_dump(), "screenshot_unavailable_reason": None}, strict=False
+        )
+
+
+def test_platform_observation_rejects_inconsistent_handles() -> None:
+    other_app = ElementRef(application=ApplicationRef(ref="app_2"), generation=0, index=1)
+    stale = ElementRef(application=APP, generation=3, index=1)
+    for bad_child in (other_app, stale, ref(0)):  # wrong app, wrong generation, duplicate
+        root = UIElement(
+            ref=ref(), role=Role.GROUP, children=(UIElement(ref=bad_child, role=Role.BUTTON),)
+        )
+        with pytest.raises(ValidationError):
+            PlatformObservation(
+                observation_id="obs_1",
+                raw_capture_id=SHA,
+                application=APP,
+                generation=0,
+                platform="synthetic",
+                normalizer=GeneratorInfo(name="n", version="1"),
+                windows=(
+                    WindowObservation(info=WindowInfo(ref=WindowRef(ref="win_a")), root=root),
+                ),
+            )
+    with pytest.raises(ValidationError, match="focused"):
+        _platform(focused=ref(5))
+    assert _platform(focused=ref(1)).focused == ref(1)
 
 
 def test_raw_observation_requires_timezone_aware_timestamp() -> None:
@@ -140,7 +181,11 @@ def test_raw_observation_requires_timezone_aware_timestamp() -> None:
             generation=0,
             captured_at=datetime(2026, 1, 1),
             platform="synthetic",
+            environment=EnvironmentKind.SYNTHETIC,
+            request_id="r" * 32,
+            correlation_id="test",
             raw_capture=RawArtifactRef(artifact_id=SHA, media_type="x/y", size_bytes=0),
+            screenshot_unavailable_reason="not requested",
             bridge_version="b",
         )
 

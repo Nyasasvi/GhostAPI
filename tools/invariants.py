@@ -59,15 +59,47 @@ def module_of(path: Path, root: Path) -> str | None:
     return None
 
 
-def imported_modules(path: Path) -> list[tuple[int, str]]:
+def imported_modules(path: Path, module: str | None = None) -> list[tuple[int, str]]:
+    """Every module a file imports, including ``from X import y`` as ``X.y``, resolved
+    relative imports, and string-literal ``importlib.import_module`` / ``__import__`` calls."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    package = module if path.name == "__init__.py" else (module or "").rpartition(".")[0]
     found: list[tuple[int, str]] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             found.extend((node.lineno, alias.name) for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
-            found.append((node.lineno, node.module))
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parts = (package or "").split(".") if package else []
+                parts = parts[: len(parts) - (node.level - 1)] if node.level > 1 else parts
+                base = ".".join([*parts, *([node.module] if node.module else [])])
+            if base:
+                found.append((node.lineno, base))
+            found.extend(
+                (node.lineno, f"{base}.{alias.name}" if base else alias.name)
+                for alias in node.names
+            )
+        elif isinstance(node, ast.Call) and node.args:
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            first = node.args[0]
+            if (
+                name in {"import_module", "__import__"}
+                and isinstance(first, ast.Constant)
+                and isinstance(first.value, str)
+            ):
+                found.append((node.lineno, first.value))
     return found
+
+
+def string_constants(path: Path) -> list[tuple[int, str]]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
 
 
 def rel(path: Path, root: Path) -> str:
@@ -91,18 +123,43 @@ _PLATFORM = re.compile(
             r"\bQuar" + r"tz\b",
             r"\bpy" + r"objc\b",
             r"\bbundle" + r"_?[iI]d(entifier)?\b",
+            r"\b(C" + r"G|N" + r"S|S" + r"C)[A-Z][a-z]\w*",
+            r"\bp" + r"id\b",
+            r"\ba" + r"x_\w+",
         ]
     )
 )
+_PLATFORM_MODULES = {
+    "Co" + "coa",
+    "App" + "Kit",
+    "Foun" + "dation",
+    "Qua" + "rtz",
+    "Application" + "Services",
+    "Core" + "Graphics",
+    "Screen" + "CaptureKit",
+    "ob" + "jc",
+    "HISer" + "vices",
+    "atom" + "acos",
+    "pyauto" + "gui",
+    "pyn" + "put",
+}
+_PLATFORM_COMMANDS = re.compile(r"\b(osa" + r"script|screen" + r"capture|cli" + r"click)\b")
 
 
 def check_platform_neutral_core(root: Path) -> Result:
     result = Result("platform-neutral Ghost Core (no platform framework vocabulary)")
     for path in iter_files(root, "ghost-core/ghost", ".py"):
+        where = rel(path, root)
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             match = _PLATFORM.search(line)
             if match:
-                result.violations.append(f"{rel(path, root)}:{number}: {match.group(0)!r}")
+                result.violations.append(f"{where}:{number}: {match.group(0)!r}")
+        for number, imported in imported_modules(path, module_of(path, root)):
+            if imported.split(".")[0] in _PLATFORM_MODULES:
+                result.violations.append(f"{where}:{number}: platform module {imported}")
+        for number, text in string_constants(path):
+            if _PLATFORM_COMMANDS.search(text):
+                result.violations.append(f"{where}:{number}: platform command in string")
     return result
 
 
@@ -125,7 +182,7 @@ def check_import_boundaries(root: Path) -> Result:
     result = Result("import boundaries (LLM, vendor SDK, harness, fixture)")
     for path in code_files(root):
         module = module_of(path, root) or ""
-        for line, imported in imported_modules(path):
+        for line, imported in imported_modules(path, module):
             where = f"{rel(path, root)}:{line}: imports {imported}"
             if any(_within(imported, sdk) for sdk in _VENDOR_SDKS) and not _within(
                 module, "ghost.llm"
@@ -275,8 +332,9 @@ def check_secret_patterns(root: Path) -> Result:
     return result
 
 
-_TART = re.compile(r"""["']ta""" + r"""rt["']""")
+_TART = re.compile(r"(^|[\s/'\"])ta" + r"rt($|\s)")
 _TART_ALLOWED = ("ghost-core/ghost/sandbox/vm.py",)
+_SHELL_ALLOWED_DIR = "ghost-vm"
 
 
 def check_vm_cli_confined(root: Path) -> Result:
@@ -284,9 +342,18 @@ def check_vm_cli_confined(root: Path) -> Result:
     for path in code_files(root):
         if rel(path, root) in _TART_ALLOWED:
             continue
-        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if _TART.search(line):
+        for number, text in string_constants(path):
+            if _TART.search(text):
                 result.violations.append(f"{rel(path, root)}:{number}: VM CLI invocation")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if not name.endswith(".sh") or rel(path, root).startswith(_SHELL_ALLOWED_DIR + "/"):
+                continue
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if _TART.search(line):
+                    result.violations.append(f"{rel(path, root)}:{number}: VM CLI in shell script")
     return result
 
 
