@@ -1,0 +1,23 @@
+# OS / editor
+.DS_Store
+
+# Research data (local only; never committed or synced)
+artifacts/
+adjudication/
+*.sqlite
+*.sqlite-*
+
+# Python
+.venv/
+__pycache__/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Swift
+.build/
+*.xcodeproj/xcuserdata/
+
+# Local configuration and secrets
+.claude/settings.local.json
+.env*
