@@ -1,0 +1,9 @@
+# Terms that must never appear in Ghost Core (ghost-core/ghost) or prompts/.
+# One term per line, matched case-insensitively as a whole phrase. '#' starts a comment.
+#
+# Held-out application names are NEVER listed here: they live outside the repository and
+# are supplied locally through $GHOST_HOLDOUT_DENYLIST (newline- or comma-separated).
+#
+# Development-app names are added when the owner selects development apps (gate G-F1).
+# Synthetic research fixture vocabulary (fixtures/ghost_fixture) is listed below so core
+# code and prompts cannot special-case the fixture.

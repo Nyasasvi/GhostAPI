@@ -1,0 +1,48 @@
+[project]
+name = "ghostapi-research"
+version = "0.1.0"
+description = "GhostAPI research instrument: platform-neutral Ghost Core and research harness (host side)."
+requires-python = ">=3.12,<3.13"
+# Runtime dependencies are limited to the approved stack (ADR-001): pydantic v2 + stdlib (sqlite3).
+dependencies = ["pydantic>=2.9,<3"]
+
+[dependency-groups]
+# Tooling named in AGENTS.md "Checks are the source of truth".
+dev = ["pytest>=8.3", "ruff>=0.6", "mypy>=1.11"]
+
+[tool.uv]
+# Not an installable distribution: packages are imported from their source roots.
+# This avoids adding a build backend dependency.
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = [".", "ghost-core", "benchmarks", "fixtures", "tools"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --import-mode=importlib"
+markers = ["vm: needs a real disposable macOS VM (BLOCKED_VM_STORAGE); never run by make check"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = [".", "ghost-core", "benchmarks", "fixtures", "tools"]
+files = ["ghost-core/ghost", "benchmarks/ghost_bench", "fixtures/ghost_fixture", "tools", "tests"]
+explicit_package_bases = true
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["ghost-core", "benchmarks", "fixtures", "tools", "tests"]
+extend-exclude = ["docs/proposals"]
+
+[tool.ruff.lint]
+# BLE: blind except (AGENTS rule 10); B: bugbear; PT: pytest style.
+select = ["E", "F", "W", "I", "B", "UP", "N", "SIM", "RUF", "BLE", "PT"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ghost", "ghost_bench", "ghost_fixture", "invariants", "tests"]
