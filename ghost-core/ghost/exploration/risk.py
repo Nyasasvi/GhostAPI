@@ -4,31 +4,37 @@ Inputs are neutral observation facts only (role, label, action kind, enclosing d
 whether a value is a generated probe). There is no override parameter: neither an LLM nor
 any caller can change a decision. Approvals are a separate, explicit human record.
 
-Rules v1 (generic English UI vocabulary; non-English or unlabelled controls fall to UNKNOWN,
-which blocks mutation):
+Rules v2 (generic English UI vocabulary; non-English or unlabelled controls fall to UNKNOWN,
+which blocks mutation). Labels are NFKC-normalized and typographic apostrophes folded.
  1. Command vocabulary is read only from command-like elements (buttons, menu items,
     checkboxes, radios, popups, unknown actionable elements, and *field labels*). Data
     elements (rows, cells, static text) are never interpreted as commands: a row titled
     "Delete me" is data.
- 2. DESTRUCTIVE beats UNKNOWN_HIGH_RISK beats everything else (conservative precedence).
- 3. Confirmation buttons (ok/yes/confirm/continue/proceed/done/apply) inside a dialog or
-    modal window inherit the strongest class found in that dialog's text.
- 4. SET_VALUE on an editable field is INPUT, allowed only with a generated probe value;
+ 2. Danger anywhere wins: a destructive word/phrase anywhere -> DESTRUCTIVE; a high-risk
+    word/noun anywhere ("account", "subscription", "checkout", ...) -> UNKNOWN_HIGH_RISK.
+ 3. Escalation words ("without", "everything", "permanently", ...) make an otherwise
+    benign-looking label UNKNOWN.
+ 4. A label is NAVIGATION or REVERSIBLE_WRITE only when its *first* word is a known
+    navigation/write verb. A benign verb later in the label never makes it benign.
+ 5. Confirmation buttons (ok/yes/confirm/continue/proceed/done/apply) in a dialog take the
+    STRONGER of their own label's class and the strongest class in the dialog's text.
+ 6. SET_VALUE on an editable field is INPUT, allowed only with a generated probe value;
     credential-like or high-risk field labels escalate.
- 5. Anything unmatched is UNKNOWN. UNKNOWN mutations are blocked until a policy for them
+ 7. Anything unmatched is UNKNOWN. UNKNOWN mutations are blocked until a policy for them
     is approved (RESEARCH.md §10).
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Iterable
 from enum import StrEnum
 
 from ghost._model import StrictModel
 from ghost.platform.types import ActionKind, GeneratorInfo, Role
 
-RISK_RULES = GeneratorInfo(name="risk-rules", version="1")
+RISK_RULES = GeneratorInfo(name="risk-rules", version="2")
 MINUS_SIGN = "\u2212"  # the typographic minus used on some "remove" buttons
 
 
@@ -47,14 +53,18 @@ _DESTRUCTIVE = {
     "destroy", "overwrite", "replace", "empty", "uninstall", "format", "revoke", "drop",
     "forget", "kill", "terminate", "-", MINUS_SIGN,
 }  # fmt: skip
-_DESTRUCTIVE_PHRASES = ("don't save", "do not save", "dont save")
+_DESTRUCTIVE_PHRASES = (
+    "don't save", "do not save", "dont save", "without saving", "discard changes",
+)  # fmt: skip
 _HIGH_RISK = {
     "send", "submit", "publish", "post", "share", "upload", "export", "purchase", "buy",
     "pay", "order", "checkout", "subscribe", "sync", "login", "logout", "signin", "signout",
     "invite", "email", "mail", "print", "call", "transfer", "install", "download",
     "authorize", "connect", "upgrade", "update", "password", "passcode", "card", "cvv",
-    "ssn", "iban", "token", "secret",
+    "ssn", "iban", "token", "secret", "account", "subscription", "unsubscribe", "billing",
+    "payment", "license", "membership", "deactivate", "suspend", "disable account",
 }  # fmt: skip
+_ESCALATE = {"without", "everything", "permanently", "entire", "forever", "irreversibly"}
 _HIGH_RISK_PHRASES = ("sign in", "sign out", "log in", "log out", "api key", "credit card")
 _WRITE = {
     "add", "new", "create", "insert", "save", "rename", "edit", "duplicate", "copy", "paste",
@@ -103,22 +113,30 @@ class RiskDecision(StrictModel):
     rules: GeneratorInfo = RISK_RULES
 
 
-def _tokens(text: str | None) -> tuple[set[str], str]:
-    lowered = (text or "").lower().strip()
-    words = set(re.findall(r"[a-z]+|[+\-" + MINUS_SIGN + "]", lowered))
-    return words, lowered
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'"})
+_TOKEN = re.compile(r"[a-z]+(?:'[a-z]+)?|[+\-" + MINUS_SIGN + "]")
+
+
+def _tokens(text: str | None) -> tuple[list[str], str]:
+    normalized = unicodedata.normalize("NFKC", text or "").translate(_APOSTROPHES)
+    lowered = " ".join(normalized.lower().split())
+    return _TOKEN.findall(lowered), lowered
 
 
 def _lexical_class(text: str | None) -> tuple[RiskClass | None, str]:
     words, lowered = _tokens(text)
-    if words & _DESTRUCTIVE or any(p in lowered for p in _DESTRUCTIVE_PHRASES):
+    present = set(words)
+    if present & _DESTRUCTIVE or any(p in lowered for p in _DESTRUCTIVE_PHRASES):
         return RiskClass.DESTRUCTIVE, "lexicon:destructive"
-    if words & _HIGH_RISK or any(p in lowered for p in _HIGH_RISK_PHRASES):
+    if present & _HIGH_RISK or any(p in lowered for p in _HIGH_RISK_PHRASES):
         return RiskClass.UNKNOWN_HIGH_RISK, "lexicon:high-risk"
-    if words & _WRITE:
-        return RiskClass.REVERSIBLE_WRITE, "lexicon:write"
-    if words & _NAVIGATION:
-        return RiskClass.NAVIGATION, "lexicon:navigation"
+    if present & _ESCALATE:
+        return RiskClass.UNKNOWN, "lexicon:escalation-word"
+    first = words[0] if words else ""
+    if first in _WRITE:
+        return RiskClass.REVERSIBLE_WRITE, "lexicon:write-verb-first"
+    if first in _NAVIGATION:
+        return RiskClass.NAVIGATION, "lexicon:navigation-verb-first"
     return None, "lexicon:none"
 
 
@@ -153,16 +171,18 @@ def classify(fact: RiskInput) -> RiskDecision:
             risk_class=RiskClass.UNKNOWN, rule_id="invoke:unlabelled-or-unknown-role", reasons=()
         )
     words, _ = _tokens(label)
-    if fact.in_dialog and words & _CONFIRM:
-        inherited = _strongest(fact.dialog_text)
-        if inherited is not None:
+    lexical, rule = _lexical_class(label)
+    if fact.in_dialog and set(words) & _CONFIRM:
+        found = [c for c in (lexical, _strongest(fact.dialog_text)) if c is not None]
+        if not found:
             return RiskDecision(
-                risk_class=inherited, rule_id="confirm:inherits-dialog", reasons=fact.dialog_text
+                risk_class=RiskClass.UNKNOWN, rule_id="confirm:unexplained-dialog", reasons=()
             )
         return RiskDecision(
-            risk_class=RiskClass.UNKNOWN, rule_id="confirm:unexplained-dialog", reasons=()
+            risk_class=max(found, key=_STRENGTH.__getitem__),
+            rule_id="confirm:stronger-of-own-and-dialog",
+            reasons=(label, *fact.dialog_text),
         )
-    lexical, rule = _lexical_class(label)
     if lexical is None and fact.role in (Role.CHECKBOX, Role.RADIO):
         return RiskDecision(
             risk_class=RiskClass.REVERSIBLE_WRITE, rule_id="invoke:toggle", reasons=()
