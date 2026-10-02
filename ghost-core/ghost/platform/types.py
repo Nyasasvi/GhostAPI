@@ -371,6 +371,11 @@ class LaunchResult(StrictModel):
     already_running: bool
 
 
+class QuitResult(StrictModel):
+    application: ApplicationRef
+    quit: bool
+
+
 class ObserveRequest(StrictModel):
     application: ApplicationRef
     max_depth: Annotated[int, Field(ge=1, le=200)] = 40

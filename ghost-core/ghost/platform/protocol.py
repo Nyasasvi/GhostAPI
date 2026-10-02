@@ -35,14 +35,21 @@ from ghost.platform.types import (
     LaunchResult,
     ObservationBundle,
     ObserveRequest,
+    QuitResult,
+    Rect,
     TypedValue,
     WindowInfo,
+    WindowRef,
 )
 
 PROTOCOL_VERSION = "1"
 MAX_DEADLINE_MS = 120_000
 
-MUTATING_OPERATIONS: frozenset[str] = frozenset({"launch", "invoke", "set_value"})
+# quit/arrange_window are the Week 4 lifecycle additions planned in the API draft (needed for
+# relaunch verification and state strata). They are app lifecycle, not generic input.
+MUTATING_OPERATIONS: frozenset[str] = frozenset(
+    {"launch", "invoke", "set_value", "quit", "arrange_window"}
+)
 READ_OPERATIONS: frozenset[str] = frozenset(
     {"health", "list_applications", "list_windows", "observe", "capture", "get_artifact"}
 )
@@ -113,6 +120,16 @@ class PlatformBridge(Protocol):
         self, ctx: RequestContext, element: ElementRef, value: TypedValue
     ) -> ActionResult:
         """Mutation (executor claim only). Stale handles raise ``STALE_HANDLE``."""
+        ...
+
+    def quit(self, ctx: RequestContext, application: ApplicationRef) -> QuitResult:
+        """Mutation: graceful quit (unsaved, unpersisted app state is lost)."""
+        ...
+
+    def arrange_window(
+        self, ctx: RequestContext, application: ApplicationRef, window: WindowRef, bounds: Rect
+    ) -> ActionResult:
+        """Mutation: move/resize a window (harness stratum setup; executor claim only)."""
         ...
 
 

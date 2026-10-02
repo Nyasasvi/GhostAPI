@@ -33,6 +33,7 @@ from ghost.platform.types import (
     ObservationBundle,
     ObserveRequest,
     PermissionState,
+    Rect,
     Role,
     StringValue,
     TruncationReason,
@@ -392,3 +393,32 @@ def test_same_operations_give_identical_evidence() -> None:
         ]
 
     assert run() == run()
+
+
+def test_quit_then_launch_relaunches_with_persisted_state(bridge: PlatformBridge) -> None:
+    app = launch(bridge)
+    bridge.invoke(ctx(), by_label(observe(bridge, app), "Increment").ref)
+    call = ctx()
+    assert bridge.quit(call, app).quit
+    assert bridge.quit(call, app).quit  # same request id: deduped, not re-executed
+    with pytest.raises(BridgeError) as gone:
+        observe(bridge, app)
+    assert gone.value.code is BridgeErrorCode.APP_NOT_FOUND
+    relaunched = launch(bridge)
+    assert relaunched != app
+    assert by_label(observe(bridge, relaunched), "count 1")  # the toy app persists its count
+
+
+def test_arrange_window_changes_only_geometry(bridge: PlatformBridge) -> None:
+    app = launch(bridge)
+    (window,) = bridge.list_windows(ctx(), app)
+    before = observe(bridge, app).platform
+    bounds = Rect(x=100.0, y=50.0, w=640.0, h=480.0)
+    bridge.arrange_window(ctx(), app, window.ref, bounds)
+    after = observe(bridge, app).platform
+    assert after.windows[0].info.bounds == bounds
+    assert after.windows[0].root.model_dump(exclude={"ref"}) != {}  # still observable
+    assert [e.label for _, e, _ in after.walk()] == [e.label for _, e, _ in before.walk()]
+    with pytest.raises(BridgeError) as missing:
+        bridge.arrange_window(ctx(), app, WindowRef(ref="win_nope"), bounds)
+    assert missing.value.code is BridgeErrorCode.WINDOW_NOT_FOUND

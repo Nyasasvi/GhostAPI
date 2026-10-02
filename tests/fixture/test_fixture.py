@@ -83,9 +83,7 @@ def test_delayed_persistence_is_lost_on_relaunch_without_save() -> None:
     disks = RecordingDisks()
     env = provider(FixtureConfig(delayed_persistence=True), disks=disks).start()
     create(env, "Unsaved")
-    bridge = env.bridge
-    assert isinstance(bridge, MockPlatformBridge)
-    bridge.terminate(env.application)
+    env.bridge.quit(ctx(), env.application)
     assert "Unsaved" not in {s.name for s in read_store(disks.disks[0])}
 
 

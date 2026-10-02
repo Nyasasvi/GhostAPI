@@ -46,6 +46,7 @@ from ghost.platform.types import (
     ObserveRequest,
     PermissionState,
     PlatformObservation,
+    QuitResult,
     RawArtifactRef,
     RawObservation,
     Readiness,
@@ -80,6 +81,7 @@ class _RunningApp:
     generation: int = -1
     handles: dict[int, str] = field(default_factory=dict)
     last: PlatformObservation | None = None
+    window_bounds: dict[str, Rect] = field(default_factory=dict)
 
 
 class MockPlatformBridge:
@@ -108,7 +110,7 @@ class MockPlatformBridge:
         self._disks: dict[str, SimulatedDisk] = dict(disks or {})
         self._running: dict[str, _RunningApp] = {}
         self._artifacts: dict[str, tuple[str, bytes]] = {}
-        self._mutations: dict[str, tuple[str, str, ActionResult | LaunchResult]] = {}
+        self._mutations: dict[str, tuple[str, str, ActionResult | LaunchResult | QuitResult]] = {}
         self._counters: dict[str, int] = {}
 
     # -- PlatformBridge -----------------------------------------------------------------
@@ -186,6 +188,7 @@ class MockPlatformBridge:
         if self.faults.malformed_next_capture:
             self.faults.malformed_next_capture = False
             document = {"format": "synthetic-raw/1", "windows": "not-a-list"}
+        document = self._with_window_bounds(running, document)
         try:
             raw_bytes = canonical_json(document).encode("utf-8")
         except (TypeError, ValueError) as error:
@@ -270,6 +273,39 @@ class MockPlatformBridge:
     ) -> ActionResult:
         return self._act(ctx, "set_value", ActionKind.SET_VALUE, element, value)
 
+    def quit(self, ctx: RequestContext, application: ApplicationRef) -> QuitResult:
+        def effect() -> QuitResult:
+            self._app(application)
+            del self._running[application.ref]
+            return QuitResult(application=application, quit=True)
+
+        result = self._mutate(ctx, "quit", f"quit:{application.ref}", effect)
+        if not isinstance(result, QuitResult):
+            raise TypeError("quit dedupe returned a non-quit result")
+        return result
+
+    def arrange_window(
+        self, ctx: RequestContext, application: ApplicationRef, window: WindowRef, bounds: Rect
+    ) -> ActionResult:
+        def effect() -> ActionResult:
+            running = self._app(application)
+            if window not in {w.ref for w in self._windows(running)}:
+                raise BridgeError(BridgeErrorCode.WINDOW_NOT_FOUND, window.ref)
+            running.window_bounds[window.ref] = bounds
+            return ActionResult(
+                action_id=f"act_{self._next('act')}",
+                request_id=ctx.request_id,
+                executed=True,
+                platform_status="ok",
+                elapsed_ms=self._latency("arrange_window"),
+            )
+
+        signature = f"arrange:{application.ref}:{window.ref}:{bounds.model_dump_json()}"
+        result = self._mutate(ctx, "arrange_window", signature, effect)
+        if not isinstance(result, ActionResult):
+            raise TypeError("arrange dedupe returned a non-action result")
+        return result
+
     # -- environment hooks (synthetic only; not part of PlatformBridge) -------------------
     def advance(self, ms: int) -> None:
         """Let simulated time pass without any action (volatility calibration, delays)."""
@@ -280,15 +316,28 @@ class MockPlatformBridge:
     def disk(self, launch_ref: str) -> SimulatedDisk:
         return self._disks.setdefault(launch_ref, SimulatedDisk())
 
-    def terminate(self, application: ApplicationRef) -> None:
-        """Simulated app quit (state not persisted by the app is lost)."""
-        self._app(application)
-        del self._running[application.ref]
-
     # -- internals ----------------------------------------------------------------------
+    @staticmethod
+    def _with_window_bounds(running: _RunningApp, document: object) -> object:
+        """Apply harness window arrangements (geometry only) to the raw capture."""
+        if not running.window_bounds or not isinstance(document, dict):
+            return document
+        windows = document.get("windows")
+        if not isinstance(windows, list):
+            return document
+        patched = []
+        for window in windows:
+            if isinstance(window, dict) and f"win_{window.get('wid')}" in running.window_bounds:
+                r = running.window_bounds[f"win_{window.get('wid')}"]
+                window = {**window, "frame": [r.x, r.y, r.w, r.h]}
+            patched.append(window)
+        return {**document, "windows": patched}
+
     def _windows(self, running: _RunningApp) -> tuple[WindowInfo, ...]:
         try:
-            capture = parse_raw_capture(running.app.raw_capture())
+            capture = parse_raw_capture(
+                self._with_window_bounds(running, running.app.raw_capture())
+            )
         except NormalizationError as error:
             raise BridgeError(BridgeErrorCode.PLATFORM_ERROR, str(error)) from error
         return tuple(
@@ -356,8 +405,8 @@ class MockPlatformBridge:
         ctx: RequestContext,
         operation: str,
         signature: str,
-        effect: Callable[[], ActionResult | LaunchResult],
-    ) -> ActionResult | LaunchResult:
+        effect: Callable[[], ActionResult | LaunchResult | QuitResult],
+    ) -> ActionResult | LaunchResult | QuitResult:
         previous = self._mutations.get(ctx.request_id)
         if previous is not None:
             if previous[:2] != (operation, signature):

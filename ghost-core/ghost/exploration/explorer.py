@@ -122,13 +122,27 @@ class ExplorationResult(StrictModel):
 
 
 class EvidenceSink(Protocol):
-    def observation(self, bundle: ObservationBundle, raw_bytes: bytes) -> None: ...
+    def session_started(self, env: Environment, seed: str) -> None: ...
+
+    def observation(
+        self, bundle: ObservationBundle, raw_bytes: bytes, screenshot_bytes: bytes | None
+    ) -> None: ...
+
+    def state(self, state: CanonicalState, observation_id: str) -> None: ...
 
     def transition(self, record: TransitionRecord) -> None: ...
 
 
 class NullSink:
-    def observation(self, bundle: ObservationBundle, raw_bytes: bytes) -> None:
+    def session_started(self, env: Environment, seed: str) -> None:
+        return None
+
+    def observation(
+        self, bundle: ObservationBundle, raw_bytes: bytes, screenshot_bytes: bytes | None
+    ) -> None:
+        return None
+
+    def state(self, state: CanonicalState, observation_id: str) -> None:
         return None
 
     def transition(self, record: TransitionRecord) -> None:
@@ -241,27 +255,35 @@ class Explorer:
         self.step += 1
         return RequestContext.derived(self.config.run_id, self.step, self.config.deadline_ms)
 
-    def _observe(self, env: Environment, mask: VolatilityMask) -> _View:
+    def _observe(
+        self, env: Environment, mask: VolatilityMask, *, record_state: bool = True
+    ) -> _View:
         bundle = env.bridge.observe(
             self._ctx(),
             ObserveRequest(application=env.application, max_nodes=self.config.max_nodes),
         )
         raw = env.bridge.get_artifact(self._ctx(), bundle.raw.raw_capture.artifact_id)
-        self.sink.observation(bundle, raw)
+        shot = bundle.raw.screenshot
+        shot_bytes = env.bridge.get_artifact(self._ctx(), shot.artifact_id) if shot else None
+        self.sink.observation(bundle, raw, shot_bytes)
         self.counters["observations"] += 1
         locators = locate_all(bundle.platform, mask)
         state = canonicalize(bundle.platform, mask)
+        if record_state:  # calibration observations are evidence, but not graph states
+            self.sink.state(state, bundle.raw.observation_id)
         return _View(bundle, state, {loc.path: ref for ref, loc in locators.items()})
 
     def _start(self, mask: VolatilityMask | None) -> tuple[Environment, VolatilityMask, _View]:
         env = self.provider.start()
+        self.sink.session_started(env, "base")
         self.counters["resets"] += 1
         if mask is None:
             idle = []
             for i in range(self.config.calibration_observations):
                 if i:
                     env.idle(self.config.calibration_idle_ms)
-                idle.append(self._observe(env, VolatilityMask()).bundle.platform)
+                view = self._observe(env, VolatilityMask(), record_state=False)
+                idle.append(view.bundle.platform)
             mask = calibrate_mask(idle)
         return env, mask, self._observe(env, mask)
 
