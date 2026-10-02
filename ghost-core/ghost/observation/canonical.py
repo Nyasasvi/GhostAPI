@@ -1,26 +1,29 @@
 """PlatformObservation -> CanonicalState: deterministic, versioned canonicalization.
 
-Canonicalizer v1 rules (each covered by tests):
+Canonicalizer v2 rules (each covered by tests):
 
 R1  Excluded from state identity, kept as volatile facts: element handles and generations,
-    observation ids and timestamps, all geometry (element and window bounds), keyboard focus,
-    window focused/main flags.
-R2  Order-insensitive: windows (sorted by title, then content hash), element states and
-    action sets (sorted). Raw attribute order never matters.
+    observation ids and timestamps, all geometry, keyboard focus, window focused/main flags.
+R2  Order-insensitive: windows (sorted by their full masked canonical identity), element
+    state and action sets (sorted). Raw attribute order never matters.
 R3  Child order is preserved (presentation order may be meaningful, e.g. list rows).
-R4  Included in identity: role, label, value, states except ``focused``, actions,
-    stable_id_hint, truncation flag, window title / modal / minimized.
-R5  A field is masked (removed from identity, recorded as volatile) only when the explicit
-    VolatilityMask says so. Masks are derived from evidence (idle re-observation), never
-    from app knowledge, and the mask id is part of the fingerprint.
-R6  Truncated (unobservable) content stays unknown: ``complete=False`` when anything was
-    truncated; nothing is invented to fill it.
+R4  Included in identity: role, label, value (with -0.0 normalized to 0.0), states except
+    ``focused``, actions, stable_id_hint, truncation flag, window title / modal / minimized.
+R5  A field is masked (removed from identity, recorded as volatile) only when the explicit,
+    evidence-derived VolatilityMask names it *and* the element's sibling role signature still
+    matches the one seen at calibration. A stale entry is not applied (recorded as a miss),
+    so a mask can never silently hide a different element. Mask paths are window-relative
+    (window title + structural path) and never depend on window ordering.
+R6  Truncated (unobservable) content stays unknown: ``complete=False``; nothing is invented.
+R7  Same-titled windows cannot be told apart by identity; their keys are ordinals over the
+    sorted order and are flagged ``ambiguous``. Consumers must not treat such keys as stable.
 """
 
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Annotated
 
@@ -32,6 +35,7 @@ from ghost.platform.types import (
     ElementRef,
     ElementState,
     GeneratorInfo,
+    NumberValue,
     PlatformObservation,
     Rect,
     Role,
@@ -40,7 +44,8 @@ from ghost.platform.types import (
     WindowObservation,
 )
 
-CANONICALIZER = GeneratorInfo(name="canonicalizer", version="1")
+CANONICALIZER = GeneratorInfo(name="canonicalizer", version="2")
+_ROOT_SIGNATURE = content_hash(["<window-root>"])
 
 
 class MaskedField(StrEnum):
@@ -48,17 +53,20 @@ class MaskedField(StrEnum):
     VALUE = "value"
 
 
-class VolatilityMask(StrictModel):
-    """(structural path, field) pairs excluded from identity because evidence showed churn."""
+class MaskEntry(StrictModel):
+    structural_path: str
+    field: MaskedField
+    sibling_signature: str
 
-    entries: tuple[tuple[str, MaskedField], ...] = ()
+
+class VolatilityMask(StrictModel):
+    """Fields excluded from identity because idle re-observation showed them churning."""
+
+    entries: tuple[MaskEntry, ...] = ()
 
     @property
     def mask_id(self) -> str:
-        return content_hash([[path, field.value] for path, field in self.entries])
-
-    def masks(self, structural_path: str, field: MaskedField) -> bool:
-        return (structural_path, field) in self.entries
+        return content_hash([e.model_dump(mode="json") for e in self.entries])
 
 
 EMPTY_MASK = VolatilityMask()
@@ -67,11 +75,12 @@ EMPTY_MASK = VolatilityMask()
 class ElementLocator(StrictModel):
     """Neutral, persistable description of where an element was observed.
 
-    Unlike ``ElementRef`` it survives re-observation, so transitions and bindings use it.
-    It is evidence about one UI layout, not entity identity.
+    Survives re-observation (unlike ``ElementRef``). Evidence about one UI layout, not entity
+    identity. ``window_ambiguous`` is true when another window shares this window's title.
     """
 
     window_key: str
+    window_ambiguous: bool = False
     path: str
     structural_path: str
     role: Role
@@ -94,6 +103,7 @@ class CanonicalNode(StrictModel):
 
 class CanonicalWindow(StrictModel):
     key: str
+    ambiguous: bool
     title: str | None
     modal: bool
     minimized: bool
@@ -106,6 +116,7 @@ class VolatileFacts(StrictModel):
     focused_path: str | None = None
     window_bounds: tuple[tuple[str, Rect | None], ...] = ()
     masked_values: tuple[tuple[str, str, str], ...] = ()
+    mask_misses: tuple[str, ...] = ()
 
 
 class CanonicalState(StrictModel):
@@ -137,74 +148,107 @@ def with_ordinals(keys: Iterable[str]) -> list[str]:
     return out
 
 
-def _sorted_windows(obs: PlatformObservation) -> list[tuple[str, WindowObservation]]:
-    """Windows ordered by title, then content (rule R2), keyed with per-title ordinals."""
+def identity_hash(state: CanonicalState) -> str:
+    """Recompute a state's fingerprint from its identity fields (detects forged states)."""
+    return content_hash(
+        {
+            "canonicalizer": state.canonicalizer.model_dump(mode="json"),
+            "mask_id": state.mask_id,
+            "complete": state.complete,
+            "windows": [
+                w.model_dump(mode="json", exclude={"key", "ambiguous"}) for w in state.windows
+            ],
+        }
+    )
 
-    def content(window: WindowObservation) -> str:
-        return content_hash(_identity_json(window.root))
 
-    ordered = sorted(obs.windows, key=lambda w: (w.info.title or "", content(w)))
-    keys = with_ordinals(f"window[{w.info.title or ''}]" for w in ordered)
-    return list(zip(keys, ordered, strict=True))
+def _normalized_value(value: TypedValue | None) -> TypedValue | None:
+    if isinstance(value, NumberValue) and value.value == 0.0:
+        return NumberValue(value=0.0)
+    return value
 
 
-def _identity_json(element: UIElement) -> object:
-    """Order key for windows: identity fields only, so handles/geometry never reorder them."""
-    return {
-        "r": element.role.value,
-        "l": element.label,
-        "v": element.value.model_dump(mode="json") if element.value else None,
-        "c": [_identity_json(c) for c in element.children],
-    }
+@dataclass
+class _Pending:
+    ref: ElementRef
+    rel_path: str
+    structural_path: str
+    role: Role
+    label: str | None
+    stable_id_hint: str | None
+    ancestors: tuple[Role, ...]
+
+
+@dataclass
+class _WindowBuild:
+    window: WindowObservation
+    root: CanonicalNode
+    pending: list[_Pending] = field(default_factory=list)
 
 
 class _Builder:
     def __init__(self, mask: VolatilityMask) -> None:
-        self.mask = mask
-        self.locators: dict[ElementRef, ElementLocator] = {}
+        self.index = {(e.structural_path, e.field): e.sibling_signature for e in mask.entries}
         self.masked_values: list[tuple[str, str, str]] = []
+        self.misses: list[str] = []
         self.complete = True
 
-    def label_of(self, element: UIElement, structural: str) -> str | None:
-        return None if self.mask.masks(structural, MaskedField.LABEL) else element.label
+    def _masked(self, structural: str, fld: MaskedField, signature: str) -> bool:
+        expected = self.index.get((structural, fld))
+        if expected is None:
+            return False
+        if expected != signature:
+            self.misses.append(f"{structural}#{fld.value}")
+            return False
+        return True
+
+    def _peek_label_mask(self, structural: str, signature: str) -> bool:
+        return self.index.get((structural, MaskedField.LABEL)) == signature
 
     def node(
         self,
         element: UIElement,
-        window_key: str,
-        path: str,
+        rel_path: str,
         structural: str,
+        signature: str,
         ancestors: tuple[Role, ...],
+        pending: list[_Pending],
     ) -> CanonicalNode:
-        label_masked = self.mask.masks(structural, MaskedField.LABEL)
-        value_masked = self.mask.masks(structural, MaskedField.VALUE)
+        label_masked = self._masked(structural, MaskedField.LABEL, signature)
+        value_masked = self._masked(structural, MaskedField.VALUE, signature)
+        value = _normalized_value(element.value)
         if label_masked:
             self.masked_values.append((structural, "label", canonical_json(element.label)))
         if value_masked:
-            dumped = element.value.model_dump(mode="json") if element.value else None
+            dumped = value.model_dump(mode="json") if value else None
             self.masked_values.append((structural, "value", canonical_json(dumped)))
         self.complete = self.complete and not element.truncated
-        self.locators[element.ref] = ElementLocator(
-            window_key=window_key,
-            path=path,
-            structural_path=structural,
-            role=element.role,
-            label=element.label,
-            stable_id_hint=element.stable_id_hint,
-            ancestor_roles=ancestors,
+        pending.append(
+            _Pending(
+                ref=element.ref,
+                rel_path=rel_path,
+                structural_path=structural,
+                role=element.role,
+                label=element.label,
+                stable_id_hint=element.stable_id_hint,
+                ancestors=ancestors,
+            )
         )
         kids = element.children
-        kid_structural = [
-            f"{structural}/{s}" for s in with_ordinals(child.role.value for child in kids)
-        ]
+        kid_signature = content_hash([child.role.value for child in kids])
+        kid_structural = [f"{structural}/{s}" for s in with_ordinals(c.role.value for c in kids)]
         kid_steps = [
-            element_step(child.role, self.label_of(child, sp), child.stable_id_hint)
+            element_step(
+                child.role,
+                None if self._peek_label_mask(sp, kid_signature) else child.label,
+                child.stable_id_hint,
+            )
             for child, sp in zip(kids, kid_structural, strict=True)
         ]
-        kid_paths = [f"{path}/{step}" for step in with_ordinals(kid_steps)]
+        kid_paths = [f"{rel_path}/{step}" for step in with_ordinals(kid_steps)]
         lineage = (*ancestors, element.role)
         children = tuple(
-            self.node(child, window_key, p, sp, lineage)
+            self.node(child, p, sp, kid_signature, lineage, pending)
             for child, p, sp in zip(kids, kid_paths, kid_structural, strict=True)
         )
         masked = [MaskedField.LABEL] if label_masked else []
@@ -212,7 +256,7 @@ class _Builder:
         return CanonicalNode(
             role=element.role,
             label=None if label_masked else element.label,
-            value=None if value_masked else element.value,
+            value=None if value_masked else value,
             states=tuple(sorted({s for s in element.states if s is not ElementState.FOCUSED})),
             actions=tuple(sorted(set(element.actions))),
             stable_id_hint=element.stable_id_hint,
@@ -221,48 +265,73 @@ class _Builder:
             children=children,
         )
 
-    def window(self, key: str, window: WindowObservation) -> CanonicalWindow:
+    def window(self, window: WindowObservation) -> _WindowBuild:
         root = window.root
-        structural = f"{key}/{root.role.value}#0"
-        step = element_step(root.role, self.label_of(root, structural), root.stable_id_hint)
-        path = f"{key}/{step}#0"
-        return CanonicalWindow(
-            key=key,
-            title=window.info.title,
-            modal=window.info.modal,
-            minimized=window.info.minimized,
-            root=self.node(root, key, path, structural, (Role.WINDOW,)),
-        )
+        structural = f"{window.info.title or ''}|{root.role.value}#0"
+        label = None if self._peek_label_mask(structural, _ROOT_SIGNATURE) else root.label
+        rel = f"{element_step(root.role, label, root.stable_id_hint)}#0"
+        pending: list[_Pending] = []
+        node = self.node(root, rel, structural, _ROOT_SIGNATURE, (Role.WINDOW,), pending)
+        return _WindowBuild(window=window, root=node, pending=pending)
 
 
-def _build(obs: PlatformObservation, mask: VolatilityMask) -> tuple[_Builder, CanonicalState]:
+def _window_order(build: _WindowBuild) -> tuple[str, str]:
+    info = build.window.info
+    identity = [info.title, info.modal, info.minimized, build.root.model_dump(mode="json")]
+    return (info.title or "", content_hash(identity))
+
+
+def _build(
+    obs: PlatformObservation, mask: VolatilityMask
+) -> tuple[dict[ElementRef, ElementLocator], CanonicalState]:
     builder = _Builder(mask)
-    keyed = _sorted_windows(obs)
-    windows = tuple(builder.window(key, window) for key, window in keyed)
-    complete = builder.complete and not obs.truncation.truncated
-    identity = {
-        "canonicalizer": CANONICALIZER.model_dump(mode="json"),
-        "mask_id": mask.mask_id,
-        "complete": complete,
-        "windows": [w.model_dump(mode="json") for w in windows],
-    }
-    focused = builder.locators.get(obs.focused) if obs.focused else None
+    built = sorted((builder.window(w) for w in obs.windows), key=_window_order)
+    title_counts = Counter(b.window.info.title or "" for b in built)
+    keys = with_ordinals(f"window[{b.window.info.title or ''}]" for b in built)
+    locators: dict[ElementRef, ElementLocator] = {}
+    windows = []
+    for key, b in zip(keys, built, strict=True):
+        info = b.window.info
+        ambiguous = title_counts[info.title or ""] > 1
+        windows.append(
+            CanonicalWindow(
+                key=key,
+                ambiguous=ambiguous,
+                title=info.title,
+                modal=info.modal,
+                minimized=info.minimized,
+                root=b.root,
+            )
+        )
+        for p in b.pending:
+            locators[p.ref] = ElementLocator(
+                window_key=key,
+                window_ambiguous=ambiguous,
+                path=f"{key}/{p.rel_path}",
+                structural_path=p.structural_path,
+                role=p.role,
+                label=p.label,
+                stable_id_hint=p.stable_id_hint,
+                ancestor_roles=p.ancestors,
+            )
+    focused = locators.get(obs.focused) if obs.focused else None
     volatile = VolatileFacts(
         focused_path=focused.path if focused else None,
-        window_bounds=tuple((key, window.info.bounds) for key, window in keyed),
+        window_bounds=tuple((k, b.window.info.bounds) for k, b in zip(keys, built, strict=True)),
         masked_values=tuple(sorted(builder.masked_values)),
+        mask_misses=tuple(sorted(set(builder.misses))),
     )
-    state = CanonicalState(
+    draft = CanonicalState(
         canonicalizer=CANONICALIZER,
         mask_id=mask.mask_id,
-        fingerprint=content_hash(identity),
-        complete=complete,
-        windows=windows,
+        fingerprint="sha256:" + "0" * 64,
+        complete=builder.complete and not obs.truncation.truncated,
+        windows=tuple(windows),
         volatile=volatile,
         source_observation_id=obs.observation_id,
         source_hash=model_hash(obs),
     )
-    return builder, state
+    return locators, draft.model_copy(update={"fingerprint": identity_hash(draft)})
 
 
 def canonicalize(obs: PlatformObservation, mask: VolatilityMask = EMPTY_MASK) -> CanonicalState:
@@ -274,27 +343,44 @@ def locate_all(
     obs: PlatformObservation, mask: VolatilityMask = EMPTY_MASK
 ) -> dict[ElementRef, ElementLocator]:
     """Locator for every element of an observation, consistent with ``canonicalize``."""
-    return _build(obs, mask)[0].locators
+    return _build(obs, mask)[0]
 
 
 def calibrate_mask(idle_observations: Sequence[PlatformObservation]) -> VolatilityMask:
     """Derive a VolatilityMask from observations taken with no action in between.
 
-    Any label/value that differs at the same structural path across idle observations is
-    churn the app produces by itself (clocks, counters, animations). The mask is evidence-
-    derived and recorded; it never encodes knowledge about a specific app.
+    A label/value that differs at the same window-relative structural path (with the same
+    sibling role signature) across idle observations is churn the app produces by itself.
+    Windows whose title is shared with another window are skipped: their elements cannot be
+    aligned reliably, and over-masking would merge genuinely different states.
     """
     if len(idle_observations) < 2:
         return EMPTY_MASK
-    seen: dict[tuple[str, MaskedField], set[str]] = {}
+    seen: dict[tuple[str, MaskedField, str], set[str]] = {}
     for obs in idle_observations:
-        builder, _ = _build(obs, EMPTY_MASK)
-        by_ref = {e.ref: e for _, e, _ in obs.walk()}
-        for ref, locator in builder.locators.items():
-            element = by_ref[ref]
-            value = element.value.model_dump(mode="json") if element.value else None
-            for field, payload in ((MaskedField.LABEL, element.label), (MaskedField.VALUE, value)):
-                key = (locator.structural_path, field)
-                seen.setdefault(key, set()).add(canonical_json(payload))
+        titles = Counter(w.info.title or "" for w in obs.windows)
+        for window in obs.windows:
+            if titles[window.info.title or ""] == 1:
+                _collect(window, seen)
     churn = sorted(key for key, values in seen.items() if len(values) > 1)
-    return VolatilityMask(entries=tuple(churn))
+    entries = tuple(MaskEntry(structural_path=p, field=f, sibling_signature=s) for p, f, s in churn)
+    return VolatilityMask(entries=entries)
+
+
+def _collect(window: WindowObservation, seen: dict[tuple[str, MaskedField, str], set[str]]) -> None:
+    root = window.root
+    stack: list[tuple[UIElement, str, str]] = [
+        (root, f"{window.info.title or ''}|{root.role.value}#0", _ROOT_SIGNATURE)
+    ]
+    while stack:
+        element, structural, signature = stack.pop()
+        value = _normalized_value(element.value)
+        dumped = value.model_dump(mode="json") if value else None
+        for fld, payload in ((MaskedField.LABEL, element.label), (MaskedField.VALUE, dumped)):
+            seen.setdefault((structural, fld, signature), set()).add(canonical_json(payload))
+        kid_signature = content_hash([c.role.value for c in element.children])
+        ordinals = with_ordinals(c.role.value for c in element.children)
+        stack.extend(
+            (child, f"{structural}/{o}", kid_signature)
+            for child, o in zip(element.children, ordinals, strict=True)
+        )

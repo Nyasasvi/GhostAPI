@@ -8,6 +8,7 @@ import pytest
 
 from ghost.observation.canonical import (
     MaskedField,
+    MaskEntry,
     VolatilityMask,
     calibrate_mask,
     canonicalize,
@@ -165,9 +166,10 @@ def test_idle_calibration_masks_churn_and_only_churn() -> None:
     idle = [build(ui(clock=t), observation_id=f"obs_{i}") for i, t in enumerate(["1", "2", "3"])]
     mask = calibrate_mask(idle)
     assert len(mask.entries) == 1
-    path, field = mask.entries[0]
-    assert field is MaskedField.LABEL
-    assert path.endswith("static_text#0")
+    (entry,) = mask.entries
+    assert entry.field is MaskedField.LABEL
+    assert entry.structural_path.endswith("static_text#0")
+    assert entry.structural_path.startswith("Items|")  # window-relative, not ordinal-based
     masked_a = canonicalize(build(ui(clock="09:59")), mask)
     masked_b = canonicalize(build(ui(clock="23:12")), mask)
     assert masked_a.fingerprint == masked_b.fingerprint
@@ -177,7 +179,11 @@ def test_idle_calibration_masks_churn_and_only_churn() -> None:
 
 def test_mask_identity_is_part_of_the_fingerprint() -> None:
     obs = build(ui())
-    other = VolatilityMask(entries=(("nowhere", MaskedField.VALUE),))
+    other = VolatilityMask(
+        entries=(
+            MaskEntry(structural_path="nowhere", field=MaskedField.VALUE, sibling_signature="s"),
+        )
+    )
     assert canonicalize(obs).fingerprint != canonicalize(obs, other).fingerprint
 
 

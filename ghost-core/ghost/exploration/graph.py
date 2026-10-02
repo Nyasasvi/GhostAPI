@@ -14,7 +14,7 @@ from pydantic import Field
 from ghost._model import SHA256_PATTERN, StrictModel, canonical_json, content_hash
 from ghost.evidence import EvidenceLevel
 from ghost.exploration.risk import RiskClass
-from ghost.observation.canonical import CanonicalState, ElementLocator
+from ghost.observation.canonical import CanonicalState, ElementLocator, identity_hash
 from ghost.observation.diff import StateDiff
 from ghost.platform.types import ActionKind, ActionResult, GeneratorInfo, TypedValue
 
@@ -83,21 +83,30 @@ class StateGraph:
         self.root: str | None = None
         self._states: dict[str, CanonicalState] = {}
         self._visits: dict[str, list[str]] = {}
+        self._seen_observations: set[str] = set()
         self._transitions: list[TransitionRecord] = []
         self._outgoing: dict[str, list[TransitionRecord]] = {}
 
     # -- mutation -----------------------------------------------------------------------
-    def add_state(self, state: CanonicalState, observation_id: str) -> bool:
-        """Record a visit; returns True when this fingerprint is new (not a revisit)."""
+    def add_state(self, state: CanonicalState, observation_id: str | None) -> bool:
+        """Record a visit; returns True when this fingerprint is new (not a revisit).
+
+        Idempotent per observation id: re-recording the same observation never double-counts.
+        ``observation_id=None`` inserts the state without a visit (snapshot loading).
+        """
         if state.canonicalizer != self.canonicalizer or state.mask_id != self.mask_id:
             raise ValueError("state was canonicalized under a different canonicalizer or mask")
+        if identity_hash(state) != state.fingerprint:
+            raise ValueError("state fingerprint does not match its identity fields")
         is_new = state.fingerprint not in self._states
         if is_new:
             self._states[state.fingerprint] = state
             self._visits[state.fingerprint] = []
             if self.root is None:
                 self.root = state.fingerprint
-        self._visits[state.fingerprint].append(observation_id)
+        if observation_id is not None and observation_id not in self._seen_observations:
+            self._seen_observations.add(observation_id)
+            self._visits[state.fingerprint].append(observation_id)
         return is_new
 
     def add_transition(self, record: TransitionRecord) -> None:
@@ -181,12 +190,13 @@ class StateGraph:
 
     # -- serialization ------------------------------------------------------------------
     def snapshot(self) -> GraphSnapshot:
+        """Insertion order is preserved, so a reloaded graph iterates identically."""
         return GraphSnapshot(
             canonicalizer=self.canonicalizer,
             mask_id=self.mask_id,
             root=self.root,
-            states=tuple(self._states[f] for f in sorted(self._states)),
-            visits=tuple((f, tuple(self._visits[f])) for f in sorted(self._visits)),
+            states=tuple(self._states.values()),
+            visits=tuple((f, tuple(v)) for f, v in self._visits.items()),
             transitions=tuple(self._transitions),
         )
 
@@ -195,14 +205,20 @@ class StateGraph:
 
     @classmethod
     def from_snapshot(cls, snapshot: GraphSnapshot) -> StateGraph:
+        """Rebuild and validate: fingerprints recomputed, visits must reference known states,
+        and the root must be the first recorded state."""
         graph = cls(snapshot.canonicalizer, snapshot.mask_id)
-        by_fp = {s.fingerprint: s for s in snapshot.states}
-        visits = dict(snapshot.visits)
-        order = [snapshot.root] if snapshot.root else []
-        order += [f for f in sorted(by_fp) if f != snapshot.root]
-        for fingerprint in order:
-            for observation_id in visits.get(fingerprint, ()):
-                graph.add_state(by_fp[fingerprint], observation_id)
+        known = [s.fingerprint for s in snapshot.states]
+        if len(set(known)) != len(known):
+            raise ValueError("snapshot repeats a state")
+        if known and snapshot.root != known[0]:
+            raise ValueError("snapshot root must be the first recorded state")
+        if [f for f, _ in snapshot.visits] != known:
+            raise ValueError("snapshot visits do not match its states")
+        for state, (_, observations) in zip(snapshot.states, snapshot.visits, strict=True):
+            graph.add_state(state, None)
+            for observation_id in observations:
+                graph.add_state(state, observation_id)
         for record in snapshot.transitions:
             graph.add_transition(record)
         return graph

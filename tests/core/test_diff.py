@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from ghost.observation.canonical import MaskedField, VolatilityMask, canonicalize
+from ghost.observation.canonical import MaskedField, MaskEntry, VolatilityMask, canonicalize
 from ghost.observation.diff import ChangeKind, diff_states
 from ghost.platform.types import ActionKind, ElementState, Role, StringValue
 from tests.support.obs import E, W, build, canon
@@ -88,6 +88,7 @@ def test_window_added_and_diff_is_deterministic() -> None:
 
 def test_states_from_different_masks_cannot_be_diffed() -> None:
     obs = build([window()])
-    other = canonicalize(obs, VolatilityMask(entries=(("x", MaskedField.VALUE),)))
+    entry = MaskEntry(structural_path="x", field=MaskedField.VALUE, sibling_signature="s")
+    other = canonicalize(obs, VolatilityMask(entries=(entry,)))
     with pytest.raises(ValueError, match="different canonicalizers or masks"):
         diff_states(canonicalize(obs), other)

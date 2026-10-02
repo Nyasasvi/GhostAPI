@@ -109,7 +109,7 @@ class BoolValue(StrictModel):
 
 class NumberValue(StrictModel):
     type: Literal["number"] = "number"
-    value: float
+    value: Annotated[float, Field(allow_inf_nan=False)]
 
 
 TypedValue = Annotated[StringValue | BoolValue | NumberValue, Field(discriminator="type")]
