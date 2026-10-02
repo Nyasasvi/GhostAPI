@@ -7,3 +7,14 @@
 # Development-app names are added when the owner selects development apps (gate G-F1).
 # Synthetic research fixture vocabulary (fixtures/ghost_fixture) is added below when the
 # fixture exists (Checkpoint 3), so core code and prompts cannot special-case it.
+Specimen Ledger
+Specimen Name
+Add Specimen
+Remove Specimen
+Rename Specimen
+Add Specimen Tag
+New Specimen
+Specimens
+Tidy Up
+Delete Preview
+Reverse Sort

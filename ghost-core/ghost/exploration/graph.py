@@ -49,6 +49,8 @@ class TransitionRecord(StrictModel):
     action: ActionDescriptor
     diff: StateDiff
     risk_class: RiskClass
+    approval_id: str | None = None
+    """The human approval that allowed this action, when its risk class required one."""
     evidence: TransitionEvidence
     evidence_level: EvidenceLevel
 

@@ -13,6 +13,7 @@ models deliberately reject Python-mode coercions such as lists for tuples.
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from collections.abc import Callable
@@ -62,6 +63,12 @@ class RequestContext(StrictModel):
         return cls(
             request_id=uuid.uuid4().hex, correlation_id=correlation_id, deadline_ms=deadline_ms
         )
+
+    @classmethod
+    def derived(cls, correlation_id: str, sequence: int, deadline_ms: int) -> RequestContext:
+        """Deterministic request id for reproducible runs (unique per correlation+sequence)."""
+        digest = hashlib.sha256(f"{correlation_id}#{sequence}".encode()).hexdigest()[:32]
+        return cls(request_id=digest, correlation_id=correlation_id, deadline_ms=deadline_ms)
 
 
 @runtime_checkable
