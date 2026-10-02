@@ -1,0 +1,449 @@
+--- a/docs/RESEARCH.md
++++ b/docs/RESEARCH.md
+@@ -1,6 +1,6 @@
+ # GhostAPI Research Protocol
+ 
+-**Status:** Draft v0.1  
++**Status:** Draft v0.2 (Week 0 protocol repair; see ADR-014)  
+ **Owner:** Human owner + research lead  
+ **Applies to:** GhostAPI research phase through the Week 6 decision gate  
+ **Authority:** This file owns the research hypotheses, falsification criteria, allowed experimental methods, contamination controls, and interpretation rules. `AGENTS.md` remains authoritative for engineering/safety invariants. `docs/BENCHMARKS.md` owns quantitative thresholds, benchmark suites, statistical methods, and baseline scoring.
+@@ -37,7 +37,7 @@
+ 
+ - macOS Accessibility (AX) observations;
+ - app/window metadata exposed through approved macOS APIs;
+-- screenshots captured inside the disposable VM;
++- screenshots captured inside the disposable VM as immutable raw evidence (visual inference over them is governed by §17);
+ - deterministic keyboard/mouse/AX actions;
+ - controlled black-box experiments;
+ - local dummy data;
+@@ -80,6 +80,10 @@
+ 
+ The claim is falsified if useful action discovery consistently depends on app-specific code, target-app documentation, prior model knowledge of the app, or human-authored workflow hints.
+ 
++The claim is also not supported if a published capability is only a recorded action sequence with a semantic name. A capability must be one public contract that works across unseen parameter values and the predeclared state strata (H3) without per-state or per-path variants. If GhostAPI needs a separate capability for each start state or UI path, or if a resilient trace-replay baseline (`BENCHMARKS.md` §9) does equally well, report that GIR adds no semantic generalization over replay.
++
++**Semantic identifiability.** Some operations produce the same observable transition (for example delete, archive, hide, remove-from-view). When no allowed experiment can tell the alternatives apart, the hypothesis must stay at the level the evidence supports (a generic name, or `UNKNOWN` semantics). It must not pick the familiar interpretation. Hidden benchmark adjudication (§13.2) scores what GhostAPI claimed. It never supplies the discriminating fact to discovery.
++
+ ### H2 — Parameter induction
+ 
+ **Claim:** GhostAPI can infer useful action parameters and types from evidence rather than inventing them.
+@@ -96,12 +100,31 @@
+ 
+ This claim is weakened when the semantic model invents unsupported parameters such as `body`, `folder`, or `priority` because those fields are common in similar apps.
+ 
++This claim is equally weakened by **under-declaration**. If the operation needs `create_event(title, date, time, location)` to do what the benchmark task asks, and GhostAPI publishes `create_event(title)`, that is not a correct schema just because `title` is right. H2 is therefore measured as both:
++
++- **precision:** declared parameters that the evidence supports;
++- **recall:** necessary parameters (defined by the hidden adjudication oracle, §13.2) that GhostAPI declared.
++
++Where observable, H2 also reports type correctness, required/optional classification, enum values, defaults, and basic constraints. Parameters whose existence or constraints cannot be observed through the allowed channels are reported as `UNKNOWN`, not as absent. Metric definitions and targets live in `BENCHMARKS.md` §7.4.
++
+ ### H3 — Re-execution
+ 
+ **Claim:** A learned capability can be executed reliably from fresh application state and across new sessions, not only from the exact discovery state.
+ 
+ A capability that works once directly after discovery but fails after app relaunch, VM reset, focus changes, or benign state changes has not demonstrated reusable machine-interface behavior.
+ 
++H3 is **not** "the same operation succeeds 20 times from one identical snapshot". Reliability trials are spread across **predeclared state strata**. Every trial still starts from a clean, externally reset state. Each stratum then applies a declared, generic setup before the call, for example:
++
++- app relaunch;
++- changed focus;
++- changed window placement;
++- reordered entities;
++- additional benign entities, different entity counts, or different list sizes;
++- benign preference or presentation variation;
++- modal and no-modal starts where the app has them.
++
++The same public capability must pass across strata without state-specific patches. The stratum list, how trials are allocated to strata, and per-stratum reporting are preregistered in `BENCHMARKS.md` §6.1. Stratification spreads the existing trial count across conditions; it does not multiply it.
++
+ ### H4 — Entity identity
+ 
+ **Claim:** When a capability targets an existing entity, GhostAPI can conservatively resolve the intended entity or refuse when identity is ambiguous.
+@@ -133,6 +156,13 @@
+ 
+ not a guess.
+ 
++H4 has two sides, and both are measured:
++
++- **Safety:** zero silent false-target executions. Executing on a request the adjudication oracle declared genuinely ambiguous counts as an unsafe resolution, even if the chosen entity happens to be the intended one.
++- **Usefulness:** on requests the oracle declared resolvable, GhostAPI must actually resolve and act. A resolver that answers `ENTITY_AMBIGUOUS` to everything is safe but useless, and does not support H4.
++
++Required metrics are the correct-resolution rate, false-target rate, ambiguous-refusal rate, not-found rate, and entity-resolution coverage. Targets live in `BENCHMARKS.md` §7.6. If no entity-targeting capability is discovered for an app, H4 is reported as **not tested** for that app, not as passed.
++
+ ### H5 — Drift resilience
+ 
+ **Claim:** A stable GIR capability can survive a UI binding change through automatic rebinding without changing the public semantic contract or adding app-specific patches.
+@@ -145,10 +175,23 @@
+ 4. the capability succeeds under the same benchmark oracle;
+ 5. no human edits selectors, menu paths, labels, prompts, or app-specific hints after seeing the failure.
+ 
++Rebinding is **not** "run discovery again and call it rebinding". A drift result must also:
++
++6. keep the same public capability, the same inputs, and the same semantic postcondition;
++7. search only for the failed semantic target, within a preregistered rebinding budget;
++8. report rebinding cost next to the cost of full rediscovery. If rebinding costs about as much as rediscovery, H5's practical value is not supported, even when rebinding succeeds;
++9. meet the normal VERIFIED reliability rule after drift.
++
++The drift taxonomy, the rebinding budget, and the cost comparison are defined in §16 and `BENCHMARKS.md` §7.9 and §14.
++
+ ### H6 — Amortized advantage
+ 
+-**Claim:** After paying one-time discovery cost, repeated GhostAPI execution is meaningfully more reliable and/or less expensive than a raw screenshot-based computer-use baseline for the same tasks.
++**Claim:** After paying one-time discovery cost, repeated GhostAPI execution is meaningfully more reliable and/or less expensive than the strongest applicable baseline for the same tasks (`BENCHMARKS.md` §9). "Meaningfully" is defined in `BENCHMARKS.md` §7.10 and is fixed before evaluation.
+ 
++Only **reliability** and **success-adjusted total cost** can support H6. Latency, action count, or token count alone cannot, although all are reported. The comparison must show that any advantage comes from GIR and semantic compilation. An advantage that comes only from better sensors (AX metadata), memory, caching, or persistent selectors is not enough, which is why the diagnostic baselines exist. If GhostAPI beats only the screenshot-only stateless baseline, report H6 as supported against that baseline only.
++
++Economic value is judged over a predeclared usage horizon and includes discovery, failed discovery attempts, trials, VM/reset overhead, retries, verification, rebinding after drift, maintenance, and human-approval overhead (`BENCHMARKS.md` §10). Do not claim an economic advantage when break-even needs unrealistic usage.
++
+ The comparison must separate:
+ 
+ - discovery cost;
+@@ -210,7 +253,23 @@
+ - not chosen because GhostAPI is already known to work on them.
+ 
+ Every revealed, failed, aborted, or partially tested holdout becomes spent.
++
++### 4.4 Synthetic research fixture
++
++The project may build **one** configurable synthetic research fixture app, and a second only if logged evidence justifies it. The fixture exists for mechanics testing, adversarial testing, and falsification tests: duplicate entities, archive/delete ambiguity, drift toggles, prompt-injection text, and dangerous-looking controls.
++
++Results on the fixture are **never** evidence of generalization. The fixture is written by the implementer and encodes the implementer's assumptions about UIs. The fixture's name, labels, and scenarios are development material and follow the same no-app-specific-code rule as any development app.
++
++### 4.5 Eligible population and claim scope
++
++Three held-out apps cannot show that GhostAPI works for "software built for humans". Before holdout selection, the human owner records:
++
++1. the **eligible population** the benchmark samples from (initial proposal: local macOS applications that work offline, can be used with dummy data, need no personal or cloud account, and expose enough observable accessibility surface to allow meaningful interaction);
++2. the **screening procedure** used to decide eligibility;
++3. an **exclusion log** of candidate apps that were screened out, each with a reason code.
+ 
++The exclusion log stays private until the benchmark report, so it cannot leak holdouts. Claims are limited to the eligible population. If GhostAPI works only for a narrower class (for example AX-rich CRUD or document apps), report that class precisely as a Case B result (§21).
++
+ ---
+ 
+ ## 5. Blind evaluation protocol
+@@ -287,36 +346,44 @@
+ 
+ ## 7. Observation model
+ 
+-An `Observation` is the raw evidence available at a point in time.
++Observation has three levels. The same names are used across all documents and code:
+ 
+-It may include:
++```text
++RawObservation  ->  PlatformObservation  ->  CanonicalState
++```
+ 
++**RawObservation**: immutable original evidence captured at one point in time. It may include:
++
+ ```text
+ timestamp
+ app/process identity
+ window list
+-AX tree
++raw AX capture (verbatim attributes)
+ focused element
+-visible text
+-screenshot path
++screenshot reference
+ input/action history
+ capture metadata
++raw bridge response
+ ```
+ 
++**PlatformObservation**: a normalized, platform-neutral UI representation derived from one RawObservation. It contains no macOS framework objects and no semantic interpretation. It still represents observed UI evidence (neutral roles, labels, values, states, bounds, supported actions, truncation markers). It carries the version of the normalizer that produced it.
++
++**CanonicalState**: a deterministic representation derived from a PlatformObservation. It removes noise and is used for state hashing (the **state fingerprint**), structured diffs, and StateGraph identity. Canonicalization rules are deterministic, versioned, tested against fixtures, and reproducible.
++
+ ### 7.1 Raw vs derived evidence
+ 
+-Raw observations are immutable.
++RawObservations are immutable.
+ 
+ Derived structures may include:
+ 
+-- canonical tree;
+-- state fingerprint;
++- PlatformObservation;
++- CanonicalState and its state fingerprint;
+ - structural diff;
+ - semantic UI annotations;
+ - transition records;
+ - entity candidates.
+ 
+-Derived structures must be reproducible from raw evidence plus versioned code/config.
++Derived structures must be reproducible from raw evidence plus versioned code/config. Every derived record carries its parent hashes and the name and version of the code that generated it.
+ 
+ ### 7.2 Unknown does not mean absent
+ 
+@@ -358,7 +425,7 @@
+ verification result
+ ```
+ 
+-State fingerprints are derived from canonicalized observations.
++State fingerprints are hashes of `CanonicalState` (§7). `from_state` and `to_state` refer to CanonicalState fingerprints, and every transition also references the RawObservations it was derived from.
+ 
+ Canonicalization may remove volatile UI noise, but it must not erase evidence required to distinguish semantically different states.
+ 
+@@ -417,7 +484,7 @@
+ - `NAVIGATION`: allowed.
+ - `INPUT`: allowed only with dummy probe values.
+ - `REVERSIBLE_WRITE`: allowed in disposable VM under the approved research policy.
+-- `UNKNOWN`: allowed only under conservative rules defined in `SECURITY.md`.
++- `UNKNOWN`: allowed only under conservative rules defined in `SECURITY.md`. Until the human owner approves those rules, any `UNKNOWN` action that may mutate state fails closed: it is not executed, and the refusal is recorded.
+ - `UNKNOWN_HIGH_RISK`: human approval required.
+ - `DESTRUCTIVE`: human approval required.
+ 
+@@ -459,6 +526,10 @@
+ 
+ Model self-confidence is not evidence.
+ 
++When the evidence fits several interpretations, the hypothesis must list them as alternatives and propose an experiment that would tell them apart using only allowed channels. If no such experiment exists, the capability is named at the level the evidence supports, or its semantics are marked `UNKNOWN` (see H1, semantic identifiability).
++
++The semantic model never receives hidden benchmark tasks, oracles, adjudication results, or baseline outputs.
++
+ ---
+ 
+ ## 12. Experiment design
+@@ -483,8 +554,14 @@
+ 
+ ---
+ 
+-## 13. Independent verification
++## 13. Independent verification and adjudication
+ 
++Two different questions are answered by two separate components. Neither may stand in for the other.
++
++### 13.1 Internal behavioral verification
++
++This asks: **did the expected observable state transition happen?** It is part of GhostAPI. It decides trial outcomes and capability status (CANDIDATE / EXPERIMENTAL / VERIFIED / REJECTED).
++
+ Executor return values do not determine success.
+ 
+ For example:
+@@ -505,7 +582,7 @@
+ 
+ ```text
+ Execution: AX action
+-Verification: visual state + persisted UI after relaunch
++Verification: fresh observation of persisted UI after relaunch
+ ```
+ 
+ or:
+@@ -517,8 +594,23 @@
+ 
+ If the only available oracle is the same UI channel, record the limitation.
+ 
+-The verifier must evaluate the declared postcondition, not merely whether the action sequence completed without error.
++The verifier must evaluate the declared postcondition, not merely whether the action sequence completed without error. Postconditions must depend on the unique probe, and must be shown to be false in the pre-action observation. A postcondition that was already true before the action cannot verify anything.
+ 
++Internal verification establishes **behavior**, not **meaning**. If GhostAPI believes `delete_document()` and observes "the document disappears from the current list", that supports a behavioral postcondition. It does not show that the operation is a delete.
++
++### 13.2 Hidden benchmark adjudication
++
++This asks: **did GhostAPI correctly understand what the operation actually does?** It belongs to the benchmark, not to GhostAPI. The benchmark oracle may know that the operation above is really `archive_document()`.
++
++Rules:
++
++- Internal behavioral success does not equal semantic correctness. Both are reported, and so is the difference between them (the false-positive postcondition rate).
++- The adjudication oracle, benchmark tasks, necessary-parameter definitions, and adjudication results are never available to discovery, hypothesis generation, experiment design, internal verification, or rebinding, before or after reveal of the app under evaluation.
++- GhostAPI's published capability set is snapshotted and hashed before any adjudication runs. Adjudication cannot change what was published.
++- GhostAPI must not invent a semantic interpretation, invent its own oracle, satisfy that oracle, and then report the interpretation as proven. The internal oracle proves only the declared behavioral postcondition.
++
++`BENCHMARKS.md` §13 defines how adjudication evidence is captured and kept sealed during trials.
++
+ ---
+ 
+ ## 14. Entity identity protocol
+@@ -532,10 +624,10 @@
+ Example:
+ 
+ ```text
+-ax:18273
++el:obs_000412:17
+ ```
+ 
+-It is not stored as semantic identity.
++It is opaque, scoped to one observation generation, and invalid once stale. It is not stored as semantic identity.
+ 
+ ### Semantic target
+ 
+@@ -599,7 +691,7 @@
+ 
+ GIR must not persist:
+ 
+-- raw ephemeral AX handles as identity;
++- raw ephemeral element handles (or any platform-native element reference) as identity;
+ - fragile absolute coordinates as the only binding;
+ - app-specific code paths inside generic runtime logic.
+ 
+@@ -609,21 +701,44 @@
+ 
+ A drift test is designed before the held-out drift result is observed.
+ 
+-Examples of drift:
++### 16.1 Drift taxonomy
+ 
+-- menu item moves to toolbar;
+-- control label changes;
+-- toolbar layout changes;
+-- a button becomes a menu command;
+-- non-semantic wrapper hierarchy changes.
++Each drift condition belongs to exactly one class. The semantic operation, its inputs, and its postcondition must stay the same.
+ 
++| Class | Example |
++|---|---|
++| D1 label change | "New" becomes "Add" or an icon-only button |
++| D2 hierarchy change | a control moves into or out of a group/container |
++| D3 control reorder | toolbar or list order changes |
++| D4 relocation | menu command moves to toolbar, or the reverse |
++| D5 added distractor | a new, similar-looking control appears nearby |
++| D6 wrapper/container change | non-semantic wrapper layers are added or removed |
++| D7 minor workflow-step change | an extra confirm step, or a sheet replaced by an inline field, with the same semantics |
++
++### 16.2 Where drift comes from
++
++- **Development drift** uses the configurable synthetic research fixture (§4.4). Each class above can be toggled there, so rebinding mechanics can be tested cheaply and repeatably. Fixture drift results are development evidence only.
++- **Real-app drift** is tested only through a legitimate, predeclared, reproducible mechanism in the app itself: configurable toolbar or layout, a UI preference, presentation customization, or a genuine version change with equivalent semantics. Nobody may edit app binaries, reverse engineer the app, or modify its internals to manufacture drift. If a held-out app has no such mechanism, report "no safe drift mechanism" for that app. Do not invent one.
++
++Before the Week 5 freeze, the research lead proposes and the human owner decides whether H5 is validated through (1) the fixture, (2) a dedicated real-app drift test, or (3) both. That decision is frozen and not revisited after seeing results.
++
++### 16.3 Rebinding versus rediscovery
++
++Automatic rebinding follows the boundary in ADR-011 and `ARCHITECTURE.md`. The deterministic GIR runtime detects the failure and requests rebinding. Semantic reasoning, if needed, happens only in `semantics/` and may only *propose* candidate bindings. A candidate becomes active only after deterministic experiments verify the unchanged semantic postcondition.
++
++Rebinding searches only for the failed semantic target, within a preregistered rebinding budget (`BENCHMARKS.md` §7.9). Rebinding cost is reported beside the cost of full rediscovery. If rebinding needs about as much search as rediscovery, report that.
++
++### 16.4 What does not count
++
+ A drift test does **not** count if:
+ 
+ - the public semantic behavior changed;
+ - a human edits the binding after failure;
+ - target-specific hints are added;
+ - the prompt is modified based on the failed held-out app;
+-- the benchmark oracle is weakened.
++- the benchmark oracle is weakened;
++- the public capability's inputs or postcondition changed to fit the new UI;
++- "rebinding" was an unscoped rerun of full discovery.
+ 
+ A passing drift result demonstrates:
+ 
+@@ -641,12 +756,20 @@
+ 
+ ## 17. Vision escalation rule
+ 
+-GhostAPI begins AX-first.
++GhostAPI begins AX-first. Two things are kept apart:
+ 
+-Vision may be added only after a measured development-app failure mode demonstrates that AX alone does not expose enough information to continue fairly.
++- **Screenshot capture** is allowed from the start. Screenshots are immutable raw evidence (part of a RawObservation).
++- **Visual inference**, meaning any model reasoning over images (multimodal semantic reasoning or visual grounding), is **disabled for GhostAPI by default**.
+ 
+-The criterion for adding vision must be defined in this file or an ADR before it is used.
++Visual inference may be enabled for GhostAPI only when all four conditions hold:
+ 
++1. a measurable, development-only AX-insufficiency criterion is preregistered in this section or in an ADR **before** the measurement it relies on;
++2. development evidence (development apps, not the synthetic fixture alone, and never a held-out app) meets that criterion;
++3. the human owner explicitly approves the escalation;
++4. the escalation happens before any affected held-out freeze.
++
++**Proposed preregistered criterion (AXI-1; status: proposed, needs approval).** AX is insufficient when, on at least 2 development apps, at least 30% of the capability families the human owner declared useful in advance are *blocked*. Blocked means the required control, input, or postcondition state is visible on screen (confirmed by human annotation of a captured screenshot) but absent or unlabeled in the AX capture, after the generic AX-enablement steps documented in `API.md`.
++
+ Examples of acceptable evidence:
+ 
+ - repeated inability to identify interactive controls represented visually but absent from AX;
+@@ -655,6 +778,8 @@
+ 
+ Vision must not be added after a held-out result merely because it would improve that result.
+ 
++**Baseline exemption (ADR-009).** The screenshot-only computer-use baseline and its variants (`BENCHMARKS.md` §9) use visual inference by design, because screenshots are the baseline's intended sensor. The exemption covers only the baseline harness. It does not allow GhostAPI to use visual inference. Baseline outputs, trajectories, and anything learned from them must never flow into GhostAPI discovery, prompts, bindings, or evals.
++
+ If vision is introduced:
+ 
+ - record model/provider/version;
+@@ -685,11 +810,14 @@
+ prompt versions/hashes
+ random seed(s)
+ risk-rule version
++platform-normalizer version
+ canonicalization version
++state-strata allocation version
+ exploration budget
+ trial budget
++LLM spend limits in force
+ benchmark/protocol version
+-oracle version
++oracle version (hash of the sealed oracle bundle)
+ network policy
+ ```
+ 
+@@ -719,8 +847,10 @@
+ 
+ and retain the evidence.
+ 
+-The benchmark protocol defines whether and how invalid infrastructure trials are rerun.
++`INVALID_INFRA` covers only faults outside GhostAPI's behavior that the harness itself detected and logged. Examples: the VM failed before GhostAPI's first action, the capture subsystem was unavailable, disk corruption, or a test-harness failure unrelated to GhostAPI. These are **GhostAPI failures, never** `INVALID_INFRA`: target unresolved, wrong control chosen, GhostAPI focus failure, an unexpected modal, a semantic error, entity ambiguity, a postcondition failure, a GhostAPI timeout, or an incorrect binding.
+ 
++A **trial** is a canonical statistical slot. A **trial attempt** is one execution of that slot. An infrastructure-invalid attempt may be replaced by another attempt of the *same* slot (same probe, same stratum). Every attempt is retained, and no slot is counted twice. Classification rules and replacement limits are defined in `BENCHMARKS.md` §8.3.
++
+ ---
+ 
+ ## 20. Research anti-patterns
+@@ -789,9 +919,10 @@
+ - semantics cannot be induced reliably;
+ - parameters are mostly hallucinated;
+ - learned capabilities fail outside discovery state;
+-- entity identity is too ambiguous;
++- entity identity is too ambiguous, or safe only because nearly everything is refused;
+ - raw computer use is as good or better after amortization;
+-- drift repair does not work.
++- GIR does no better than resilient trace replay (record-and-replay with better names);
++- drift repair does not work, or costs about as much as rediscovery.
+ 
+ The correct response is to stop or materially rethink the thesis.
+ 
+@@ -802,9 +933,10 @@
+ - works well only for document-style apps;
+ - works only when AX quality is high;
+ - works only for CRUD-like workflows;
+-- works only where semantic state is exposed through structured accessibility.
++- works only where semantic state is exposed through structured accessibility;
++- beats only the screenshot-only baseline, not the AX-enabled, cached, or replay baselines.
+ 
+-The research contribution becomes identifying that class precisely.
++The research contribution becomes identifying that class precisely, within the eligible population recorded under §4.5.
+ 
+ That boundary can become the initial product scope.
+ 
+@@ -815,10 +947,12 @@
+ - discover useful semantic capabilities;
+ - infer supported parameters;
+ - re-execute them reliably;
+-- resolve or safely reject entity identity;
+-- compare favorably with the baseline after discovery;
+-- survive at least one predeclared UI drift condition through automatic rebinding.
++- resolve entity identity usefully while safely rejecting ambiguous cases;
++- compare favorably with the strongest applicable baseline after discovery, by the H6 definition in `BENCHMARKS.md` §7.10;
++- survive at least one predeclared UI drift condition through automatic rebinding at a cost clearly below rediscovery.
+ 
++Even in Case C, claims stay limited to the eligible population (§4.5).
++
+ Only then should the project expand into a developer product.
+ 
+ ---
+@@ -835,6 +969,13 @@
+ - once a held-out app has influenced a protocol change, that app is spent;
+ - final benchmark runs must use a protocol frozen before app reveal.
+ 
++Version history:
++
++| Version | Change | ADR |
++|---|---|---|
++| v0.1 | Initial draft | none |
++| v0.2 | Week 0 protocol repair: observation terminology; H1 construct validity and identifiability; H2 recall; H3 state strata; H4 usefulness; H5 rebinding vs rediscovery and drift taxonomy; H6 definition; verification/adjudication split; INVALID_INFRA and trial/attempt; fixture and population scope; vision gate and baseline exemption | ADR-009, ADR-011, ADR-014 |
++
+ ---
+ 
+ ## 23. Open research questions

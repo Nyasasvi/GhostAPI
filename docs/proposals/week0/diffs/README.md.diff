@@ -1,0 +1,17 @@
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,4 @@
+-# GhostAPI build kit (v4)
++# GhostAPI build kit (v5)
+ 
+ This kit bootstraps the **research phase** of GhostAPI.
+ 
+@@ -10,7 +10,7 @@
+ 
+ ## Start here
+ 
+-Copy this kit into the root of an empty `ghostapi` repository, open Claude Code (or another coding agent) there, and say:
++This directory (`/Users/yasasvi/Desktop/GhostAPI`) is the canonical GhostAPI Git repository and the single source of truth for code, docs, commits, tags, experiments, manifests, and benchmark evidence. Do not copy it elsewhere. Open Claude Code (or another coding agent) here and say:
+ 
+ > Read `KICKOFF_PROMPT.md` and follow it.
+ 

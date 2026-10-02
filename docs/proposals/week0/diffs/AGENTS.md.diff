@@ -1,0 +1,75 @@
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -23,7 +23,7 @@
+ 4. Never commit secrets. API keys come from env; `gitleaks` runs in CI.
+ 5. Every feature requires tests.
+ 6. Every bug fix requires a regression test that failed before the fix.
+-7. Keep files under 500 lines. Split by responsibility, not arbitrarily.
++7. Keep source files under 500 lines. Split by responsibility, not arbitrarily. (Documentation in `docs/` is exempt.)
+ 8. Strict typing: `mypy --strict` for Python, and no force-unwraps or `try!` in Swift outside tests.
+ 9. SQLite migrations are versioned and reversible where possible.
+ 10. Never silently swallow exceptions. Catch narrowly, and log or re-raise with context. Bridge AX errors are always surfaced.
+@@ -41,10 +41,13 @@
+ ## Architecture boundaries (non-negotiable)
+ 
+ - **Ghost Bridge is the only code that touches macOS AX, input, or capture.** Ghost Lab talks to it only through the RPC client.
++- **Ghost Core is platform-neutral** (`Ghost Core -> PlatformBridge -> MacOSBridge`, ADR-007). It consumes only neutral DTOs (`RawObservation` references, `PlatformObservation`, `CanonicalState`, and so on) and never names macOS framework concepts. `MacOSBridge` is the only platform implementation during the research phase.
+ - **All VM operations go through the `ghost-vm` adapter.** No shelling out to `tart` elsewhere.
+ - **All LLM calls go through `LLMProvider`** (`ghost/llm/`). Business logic never imports a vendor SDK. `MockProvider` exists for tests.
+ - **Prompts live in `prompts/`**, versioned by filename (`hypothesis_v1.md`), never inline in Python.
+ - **No LLM in `exploration/`, `observation/`, `experiments/`, or `gir/runtime`.** If normal code can reliably do it, don't ask an LLM. The LLM is used for ambiguity (naming, hypothesizing), code for certainty (hashing, diffing, risk rules, statistics, verification).
++- **Rebinding boundary (ADR-011).** `gir/runtime` stays deterministic. It may detect binding failure, search deterministic candidates, request rebinding, and consume an already validated binding version. Semantic reasoning for rebinding lives only in `semantics/` and may only *propose* candidates. A candidate becomes active only after deterministic experimental verification.
++- **Evaluation harness is outside the discovery pipeline (ADR-010).** Baseline arms, the natural-language router, and adjudication live in the benchmark harness. They may call LLMs through `LLMProvider`. Discovery code never imports them, and never reads their outputs or the sealed adjudication store.
+ - **The LLM never supplies confidence.** Reliability comes from repeated trials and measured outcomes.
+ - **The LLM proposes hypotheses; deterministic code designs/runs experiments.** Never hand the LLM unrestricted control of exploration.
+ - **CLI commands are thin.** Logic lives in modules; `cli.py` parses args and calls them.
+@@ -64,7 +67,7 @@
+ 8. Entity resolution is conservative: ambiguous resolution returns `ENTITY_AMBIGUOUS`; GhostAPI never guesses which real entity the caller meant.
+ 9. Semantic capabilities and runtime bindings are separate. A binding may change without changing the GIR capability contract.
+ 10. No hardcoded model names; they come from config.
+-11. Scope gate: no REST, MCP, SDKs, web UI, Postgres, or vision before the human approves it (see ADR-005).
++11. Scope gate: no REST, MCP, SDKs, web UI, or Postgres before the human approves it (see ADR-005). Visual inference by GhostAPI follows the escalation gate in ADR-009 and `RESEARCH.md` §17. The screenshot baseline is exempt, and that exemption never extends to GhostAPI.
+ 12. Freeze: after tag `ghostapi-discovery-v0.1`, no changes motivated by a held-out app.
+ 13. No benchmark contamination: held-out app names, docs, tutorials, screenshots, source code, automation scripts, accessibility maps, or web search results may not be added to prompts, fixtures, code, or retrieval context.
+ 14. No personal data in research VMs: no personal Apple ID, iCloud, email, payment methods, browser profiles, credentials, synced folders, contacts, calendars, or production accounts.
+@@ -99,7 +102,8 @@
+ ### Trial protocol
+ 
+ - Each capability is evaluated over the benchmark-defined `N` independent trials; the default target is `N >= 20` unless `BENCHMARKS.md` specifies otherwise.
+-- Every trial starts from a clean VM snapshot or an independently verified equivalent clean state.
++- Every trial starts from a clean VM snapshot or an independently verified equivalent clean state, then applies its preregistered state-stratum setup (`BENCHMARKS.md` §6.1).
++- A trial is a statistical slot; a trial attempt is one execution of it. Infrastructure-invalid attempts are replaced only under `BENCHMARKS.md` §8.3 and are never double-counted.
+ - Probe values are unique per trial so stale state cannot create false positives.
+ - Verification occurs after the action from a fresh observation. Where persistence matters, relaunch/reopen before judging persistence.
+ - Record every trial, including failures, timeouts, ambiguity, crashes, and refused actions. Never discard an inconvenient run.
+@@ -112,10 +116,10 @@
+ 
+ - capability recall: useful benchmark capabilities discovered / useful benchmark capabilities defined by the suite
+ - capability precision: verified published capabilities / published capabilities
+-- parameter/schema accuracy
+-- empirical execution success rate across fresh trials
+-- entity-resolution success and ambiguity rate where entities are involved
+-- false-positive postcondition rate
++- parameter/schema accuracy (precision and necessary-parameter recall)
++- empirical execution success rate across fresh trials, per state stratum
++- entity-resolution success, coverage, and ambiguity rate where entities are involved
++- false-positive postcondition rate (internal verification passed, hidden adjudication failed)
+ - exploration actions, wall-clock time, LLM tokens, model calls, vision calls, and monetary cost
+ - post-learning execution latency, tokens/calls, and monetary cost
+ - crash/refusal/destructive-action rate
+@@ -125,13 +129,13 @@
+ 
+ ### Baseline fairness
+ 
+-The raw computer-use baseline and GhostAPI receive the same task intent, same starting VM/app state, same allowed credentials/data, and comparable execution budget unless the benchmark explicitly measures amortized cost.
++Every baseline arm (`BENCHMARKS.md` §9) and GhostAPI receive the same task intent, same starting VM/app state, same allowed credentials/data, and comparable execution budget unless the benchmark explicitly measures amortized cost. A human never translates benchmark tasks into GhostAPI calls; routing uses the frozen router (`BENCHMARKS.md` §9.5).
+ 
+ Report separately:
+ 
+ - **discovery/learning cost** for GhostAPI
+ - **amortized execution cost** after learning
+-- **per-task cost** for the raw computer-use baseline
++- **per-task cost** for each baseline arm
+ 
+ Do not hide GhostAPI's upfront learning cost when comparing it with a zero-shot baseline.
+ 

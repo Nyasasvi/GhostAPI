@@ -1,0 +1,62 @@
+--- /dev/null
++++ b/.claude/skills/task-workflow/SKILL.md
+@@ -0,0 +1,59 @@
++---
++name: task-workflow
++description: Use for every GhostAPI implementation or documentation task. Defines the bounded-task template, inspect-before-change sequence, independent review, definition of done, and completion report. It references authoritative docs and never restates their policy.
++---
++
++# task-workflow
++
++Policy lives in the authoritative docs, not here. For thresholds, security rules, architecture rules, benchmark rules, or research protocol, read the source: `AGENTS.md`, `docs/RESEARCH.md`, `docs/BENCHMARKS.md`, `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/API.md`, `docs/DATA_MODEL.md`, `docs/DECISIONS.md`. If this skill ever seems to conflict with them, they win. Stop and report the conflict.
++
++## 1. Task spec (write it before touching anything)
++
++```text
++Task ID / title:
++Week and approved task list reference:
++Bounded outcome:          one observable result, stated so it can fail
++Exact read list:          files and doc sections; nothing else unless the read list is amended
++Requirements:             numbered, testable
++Do-not-touch list:        files, docs, gates, and scope explicitly out of bounds
++Approval gates crossed:   list them, or "none". If any are crossed, stop and ask before proceeding
++Checks/tests:             exact commands and new tests (unit, contract, invariant, VM)
++Proposed file changes:    paths plus one-line purpose each
++Migration impact:         schema/data/artifact changes, or "none"
++Doc/ADR impact:           which authoritative docs or ADRs must change in the same commit
++Experiment cost impact:   extra trials, VM time, model calls, tokens, storage, approvals, or "none"
++```
++
++## 2. Sequence
++
++1. **Inspect.** Run `git status` and preserve unrelated changes. Read the read list, the code being changed, and its direct imports and callers.
++2. **Confirm scope.** Check the task is in the approved week's list and crosses no gate. If a holdout is involved, follow `docs/BENCHMARKS.md` before looking at anything.
++3. **Propose.** State the file changes and migration impact. If a higher-authority doc must change, show the exact diff and wait for owner approval.
++4. **Test first** for pure logic. For a bug, write a failing regression test first.
++5. **Implement** the smallest change that meets the requirements. Put ideas that go beyond scope in `IDEAS.md`.
++6. **Run checks.** Run `make check`, plus `make test-vm` for VM-facing work. Keep the actual summary lines.
++7. **Independent review.** A fresh session or model that did not implement the task receives the task spec, the relevant authoritative docs, the diff, and the check results. The reviewer checks correctness, research validity, architecture leakage, app-specific assumptions, error handling, security, unnecessary complexity, and missing tests. The reviewer reports findings and **does not rewrite** the implementation.
++8. **Resolve.** The implementer addresses each finding (fix + test, or reasoned rejection), then reruns the checks.
++9. **Commit.** Small logical commits whose messages say *why*. Update docs and ADRs in the same commit.
++
++## 3. Definition of done
++
++- Requirements met, and the tests that prove them exist and pass.
++- `make check` passes (and `make test-vm` where relevant). Summary lines are captured.
++- Review findings are all resolved or explicitly rejected with reasons.
++- Docs and ADRs are updated. No gate was crossed without a recorded approval.
++- For research or benchmark work: the manifest and raw artifacts are written, and the report can be regenerated.
++
++## 4. Completion report (short)
++
++```text
++What changed and why:
++Docs/ADRs updated:
++Checks run (paste summary lines):
++Artifacts/manifests produced:
++Certainty labels:          verified in VM / verified on fixtures only / assumed / unknown
++Unresolved risks / known failures:
++Pending human approvals:
++```
++
++Never write "should work", "looks correct", or "probably passes" as a status.

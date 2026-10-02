@@ -1,0 +1,110 @@
+# GhostAPI Security Model and Risk Policy
+
+**Status:** Draft v0.1 (Week 0 proposal; not yet authoritative)
+**Design stance:** fail closed. When a check cannot prove it is safe, the action does not run and the refusal is recorded.
+**Related:** `AGENTS.md` (approval gates, invariants), ADR-008 (transport), ADR-009 (vision), ADR-012 (VM and network), ADR-013 (LLM budget).
+
+---
+
+## 1. Assets and trust boundaries
+
+| Asset | Where | Must never happen |
+|---|---|---|
+| Owner's host, files, accounts, keychain | host | touched by the guest, the target app, or exploration |
+| LLM provider credentials | host environment only | enter the guest, the logs, the artifacts, or git |
+| Research evidence (artifacts, SQLite) | host | be mutated after capture, synced to the cloud, or deleted without approval |
+| Sealed oracle bundle / adjudication store | host, outside discovery paths | reach discovery, prompts, or agent context before the report |
+| Holdout identities | owner's private storage | appear in the repo, prompts, fixtures, CI, or agent context before reveal |
+
+Trust levels: **host Ghost Lab** (trusted code, untrusted inputs) > **guest bridge** (our code, running in an untrusted environment) > **target app, its UI text, and bridge responses** (untrusted).
+
+---
+
+## 2. Three planes (kept distinct)
+
+| Plane | Direction | Allowed | Controls |
+|---|---|---|---|
+| **Host management plane** | host → guest | SSH, bridge RPC over an SSH local forward, artifact extraction | Key-only SSH with a pinned host key (never disable host-key checking). Bridge binds guest `127.0.0.1`; the tunnel binds host `127.0.0.1`. Per-boot bearer token. Strict schemas, deadlines, and size limits. |
+| **Guest target-app network plane** | guest → anywhere | nothing by default | Isolation mechanism per ADR-012 (default: guest packet-filter default-deny, no host privilege). Per-trial egress probes: DNS lookup, direct-IP TCP, and host-service port must all fail, or the attempt is aborted (`ISOLATION_PROBE_FAILED`). Network apps are not eligible. |
+| **Host LLM-provider plane** | host → provider | semantic, router, and baseline calls through `LLMProvider` | Credentials from host environment only. Budget caps (ADR-013). Evidence minimized and aliased. Calls never originate in the guest. |
+
+---
+
+## 3. Threats and controls
+
+| Threat | Control | Acceptance evidence (tests) |
+|---|---|---|
+| Sandbox / guest escape | Disposable clones; sealed base never booted; no writable host mounts (`--dir` unused during exploration/trials); `--no-clipboard`; `--no-usb-accessories` (flag name to verify with `tart run --help`); `--no-audio`; the bridge runs as a non-admin GUI user; Tart kept at a pinned version | host canary file is unreadable and unwritable from the guest; no shared directories in the VM config |
+| Guest network side effects | §2 guest plane; default-deny; per-trial probe | DNS and direct-IP egress probes fail; host-service probe fails; host → guest management still works |
+| Real-account contamination | No Apple ID, iCloud, keychain sync, profiles, or personal data; dummy local accounts only; base audit manifest | base audit checklist signed off by the owner; manifest records the base digest |
+| Destructive controls | Deterministic risk classifier before every action; default-deny for DESTRUCTIVE and UNKNOWN_HIGH_RISK; action budgets; recorded approvals | ≥50 adversarial risk cases (misleading labels, submit-on-enter, overwrite/delete, dangerous-looking benign controls) with unsafe-execution rate = 0 |
+| Secrets leakage | Keys only in the host environment; never passed to the guest; log redaction; gitleaks in `make check` | gitleaks clean; log-redaction fixture tests |
+| LLM data leakage | Only dummy data exists in the VM; app identity aliased in evidence packets; minimized packets (≤ 12k tokens); screenshots reach a vendor only through the baseline harness | packet-builder tests assert alias substitution and size caps |
+| Prompt injection through UI text | Visible app text is **data, never instructions**. It is placed in delimited evidence fields. LLM output is schema-validated. The LLM cannot choose raw actions: experiments are compiled by deterministic code from observed controls and pass the risk gate. | semantic eval cases with injected text: outputs stay schema-valid and propose no out-of-policy actions |
+| Host/guest trust | Bridge responses are untrusted: strict schema validation, size and path limits, hash verification of every artifact, and no guest-supplied paths used on the host | malformed, oversized, and wrong-hash response tests |
+| Artifact tampering / loss | Content addressing; write-once plus read-only; append-only DB triggers; FileVault-backed host disk; no cloud sync of `artifacts/`; deletion only with approval | integrity re-hash check; trigger tests |
+| TCC authority creep | The bridge is a stable-signed app bundle granted only Accessibility and Screen Recording. No Full Disk Access, no SIP changes, no TCC database edits. Grants are made manually by the owner and verified through `/v1/health`. | health reports `granted`; grants survive clone creation (verified in the spike) |
+| Holdout leakage | Names are held outside the repo; the denylist check runs locally; adjudication store is separate; approval prompts describe evidence, not semantics | invariant tests; review checklist |
+
+---
+
+## 4. Risk policy
+
+| Class | Default | Notes |
+|---|---|---|
+| `READ_ONLY` | allowed | |
+| `NAVIGATION` | allowed | |
+| `INPUT` | allowed with dummy probe values only | probe values are unique per trial |
+| `REVERSIBLE_WRITE` | allowed in a disposable clone | reversal is never used as cleanup; reset is reclone |
+| `UNKNOWN` | **mutations fail closed** until the owner approves an explicit policy; read-only `UNKNOWN` inspection (for example reading attributes) is allowed | proposed future policy (not active): only in a throwaway clone, dummy probes, not in any state an experiment depends on, at most K per run |
+| `UNKNOWN_HIGH_RISK` | blocked; human approval required per action | |
+| `DESTRUCTIVE` | blocked; human approval required per action | |
+
+The classifier is deterministic and versioned (`risk_rule_version`). Misclassification toward safety (blocking a benign action) is preferred to the reverse, and the rate of blocked useful actions is measured (kill-pass K13).
+
+### 4.1 Approval record format
+
+```json
+{"approval_id": "apr_…", "requested_at": "…", "run_id": "…", "risk_class": "DESTRUCTIVE",
+ "subject": {"observed_control": {"role": "button", "label_as_observed": "…"},
+             "pre_observation_id": "obs_…", "proposed_primitive": "INVOKE",
+             "evidence_refs": ["sha256:…"]},
+ "decision": "approved|denied", "decided_by": "owner", "decided_at": "…", "minutes_spent": 2}
+```
+
+During held-out runs, the approval request and decision describe only observed evidence. The owner never adds semantics ("yes, that's the archive button"). Approval time is recorded as human cost.
+
+---
+
+## 5. Host-side constraints (no privilege escalation by default)
+
+Without explicit owner approval, the project does **not**:
+
+- modify sudoers, set SUID bits, install privileged helpers, or change host firewall or routing;
+- disable SIP on host or guest, or edit TCC databases;
+- grant Full Disk Access;
+- sync artifacts to cloud storage.
+
+Softnet (host-side packet filtering) needs a SUID bit or passwordless sudo, so it is **not** used unless the owner approves it (ADR-012).
+
+---
+
+## 6. Residual risks (accepted only with owner sign-off)
+
+1. **Guest-side filtering sits inside the guest.** A target app that gains root in the guest could disable it. Mitigations: non-admin GUI user, admin credentials not stored in the guest session, SIP on, a per-trial egress probe that aborts on failure, and research apps that are dummy-data local apps. Upgrade path: Softnet with approval.
+2. **Guest → host reachability on the NAT gateway** is blocked by the guest filter, not by the host. The same caveat as (1) applies.
+3. **Tart itself** (FSL-1.1-ALv2, OpenAI-maintained) is a trusted component. It is pinned, and upgrades are recorded in the manifest.
+4. **Vendor exposure.** Evidence packets (aliased) and baseline screenshots of dummy data are sent to the LLM provider.
+
+---
+
+## 7. Verification before first use
+
+The Week 0/1 spike must record evidence for each of the following before any exploration:
+
+- host → guest SSH and tunnel work;
+- guest DNS egress fails, guest direct-IP egress fails, and a guest → host service probe fails;
+- `/v1/health` shows both permissions granted and `is_vm` true;
+- the host canary is unreachable from the guest;
+- artifact round trip with hash verification works;
+- a trial clone is deleted only after artifacts are committed, and quarantined on extraction failure.

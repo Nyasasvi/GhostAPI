@@ -1,0 +1,58 @@
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -31,8 +31,8 @@
+ ## Layout
+ 
+ ```
+-ghost-core/ghost/   observation/ exploration/ semantics/ experiments/ gir/ llm/ storage/ sandbox/ cli.py
+-ghost-bridge/       Accessibility/ Capture/ Input/ Windows/ RPC/
++ghost-core/ghost/   platform/ observation/ exploration/ semantics/ experiments/ gir/ llm/ storage/ sandbox/ cli.py
++ghost-bridge/       Accessibility/ Capture/ Input/ Windows/ Normalize/ RPC/   (MacOSBridge; the only platform implementation)
+ ghost-vm/           create-base.sh clone.sh reset.sh provision.sh destroy.sh
+ prompts/            versioned prompt files (hypothesis_v1.md, ...)
+ evals/              semantic_cases.jsonl, risk_cases.jsonl, runner + results
+@@ -63,31 +63,36 @@
+ 
+ ```text
+ unseen app
+-  -> raw observation
+-  -> canonical state
++  -> RawObservation
++  -> PlatformObservation
++  -> CanonicalState
+   -> deterministic exploration
+   -> observed transition
+   -> LLM semantic hypothesis
+   -> deterministic experiment
+-  -> independent verification
+-  -> repeated clean-state trials
++  -> internal behavioral verification
++  -> repeated clean-state trials across state strata
+   -> empirical reliability
+   -> GIR semantic capability
+   -> replaceable runtime binding
+ ```
+ 
++Hidden benchmark adjudication (was the *meaning* right?) happens outside this pipeline, after publication, and never feeds back into it.
++
+ The LLM proposes semantics; measured behavior decides whether a capability exists.
+ 
+ ## Glossary
+ 
+-- **Observation:** one normalized snapshot (tree, windows, focus, visible text, screenshot path, state hash).
+-- **Raw observation:** immutable AX/capture evidence before canonicalization or semantic interpretation.
+-- **Canonical tree:** noise-reduced observation representation; its hash is a **state fingerprint**, not ground-truth app state.
++- **RawObservation:** immutable original evidence (raw bridge output, raw AX capture, screenshot reference, focus/window info, capture metadata). Defined in `docs/RESEARCH.md` §7.
++- **PlatformObservation:** normalized, platform-neutral UI representation derived from a RawObservation; no macOS framework objects and no semantic interpretation.
++- **CanonicalState:** deterministic, versioned, noise-reduced representation derived from a PlatformObservation; its hash is a **state fingerprint**, not ground-truth app state.
+ - **Transition:** `(from_state, action, inputs, to_state, diff)` based on observed evidence.
+ - **StateGraph:** observed states as nodes and observed transitions as edges.
+ - **Hypothesis:** an LLM-proposed semantic capability plus parameters and a testable experiment.
+ - **Experiment:** deterministic procedure used to test a hypothesis.
+-- **Trial:** one clean-state execution of an experiment, judged by independent verification.
++- **Trial:** one canonical statistical slot of an experiment (fixed stratum and probe), judged by internal behavioral verification. Counted once.
++- **Trial attempt:** one execution of a trial slot; infrastructure-invalid attempts may be replaced under `docs/BENCHMARKS.md` §8.3, and all attempts are kept.
++- **Internal verification vs adjudication:** internal verification checks the observed behavioral postcondition; hidden benchmark adjudication checks semantic correctness and is never visible to discovery.
+ - **Capability:** a semantic operation admitted to GIR only according to the current benchmark/reliability policy in `docs/BENCHMARKS.md`.
+ - **Binding:** current UI-level implementation of a semantic target; bindings may change without changing the GIR contract.
+ - **Ghost entity handle:** GhostAPI-owned reference resolved from observed identity evidence; never pretend it is an app-native ID.

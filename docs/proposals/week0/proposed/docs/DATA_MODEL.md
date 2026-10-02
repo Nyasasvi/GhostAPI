@@ -1,0 +1,93 @@
+# GhostAPI Data Model
+
+**Status:** Draft v0.1 (Week 0 proposal; not implemented)
+**Storage:** SQLite for metadata. A content-addressed filesystem store for raw and large artifacts. Hashes link the two (ADR-001).
+**Out of scope:** Postgres, Redis, queues, S3/object stores, hosted databases, cloud infrastructure, distributed systems.
+
+---
+
+## 1. Principles
+
+1. **Raw evidence is append-only.** Raw rows reject `UPDATE`/`DELETE` through SQLite triggers. Raw files are written once, fsynced, renamed atomically, and made read-only (`0444`).
+2. **Derived records are regenerable.** Each one stores its parent hash(es) and `generator` + `generator_version`. Regenerating writes a *new* derived row (a new version) and never overwrites the old one.
+3. **Trials are counted once.** `trial` is the statistical slot. `trial_attempt` is an append-only execution record (`BENCHMARKS.md` §8.3).
+4. **Discovery and adjudication are physically separate.** Adjudication data lives in a separate database file under a separate root that discovery code cannot open (enforced by an invariant check).
+5. **IDs:** typed, prefixed, collision-resistant (`run_…`, `obs_…`, UUIDv7 or a content hash). Artifact IDs are `sha256:<hex>`. Deterministic IDs are used where idempotency needs them: `trial_id = sha256(experiment_id, slot_index)`.
+
+---
+
+## 2. Artifact store
+
+```text
+artifacts/                                  (gitignored; local; never synced)
+└── objects/sha256/ab/cd/<full-hex>         write-once blobs: raw AX JSON, PNG, raw bridge responses, trial logs
+    .partial/                               in-flight writes (renamed after hash + fsync)
+    quarantine/                             artifacts from clones whose extraction failed
+adjudication/                               (separate root, outside every discovery-readable path)
+└── objects/…                               sealed oracle captures
+```
+
+Write protocol: stream to `.partial/<uuid>` → compute SHA-256 → fsync → `rename()` to `objects/…` → chmod `0444` → insert the `raw_artifact` row. If the hash already exists, keep the stored blob and record the duplicate reference.
+
+---
+
+## 3. Tables (conceptual)
+
+Approved conceptual set, plus three additions **marked (added, needs approval)**. Each addition is required by an existing rule.
+
+| Table | Kind | Key columns | Notes |
+|---|---|---|---|
+| `run_manifest` | raw | `run_id`, `kind` (observe/explore/learn/trial/bench/baseline), `manifest_artifact_id`, `git_sha`, `dirty`, `config_hash`, `seed`, `started_at`, `ended_at`, `status` | the manifest JSON is itself an artifact (AGENTS rule 17) |
+| `session` | raw | `session_id`, `run_id`, `vm_clone_name`, `seed_id`, `base_image_digest`, `app_alias`, `app_version_hash`, `stratum`, `started_at`, `ended_at` | one app/VM interaction period |
+| `raw_artifact` | raw | `artifact_id` (sha256), `media_type`, `bytes`, `created_at`, `source` (bridge/harness/host) | metadata for the blob store |
+| `raw_observation` | raw | `observation_id`, `session_id`, `generation`, `captured_at`, `raw_artifact_id`, `capture_artifact_id?`, `bridge_version`, `truncated`, `truncation_reasons` | immutable evidence bundle |
+| `platform_observation` | derived | `platform_observation_id`, `observation_id`, `normalizer_version`, `artifact_id`, `parent_hash` | regenerable offline from `raw_artifact` |
+| `canonical_state` | derived | `state_fingerprint`, `canonicalizer_version`, `artifact_id` | fingerprint = hash of canonical form |
+| `observation_state` | derived | `platform_observation_id`, `canonicalizer_version` → `state_fingerprint` | lets canonicalizer versions coexist |
+| `primitive_action` | raw | `action_id`, `session_id`, `request_id`, `pre_observation_id`, `handle`, `primitive`, `inputs_json`, `risk_class`, `risk_rule_version`, `approval_id?`, `executor_claim_json`, `started_at`, `ended_at` | the executor claim is stored and never treated as evidence |
+| `transition` | derived | `transition_id`, `action_id`, `from_fingerprint`, `to_fingerprint`, `canonicalizer_version`, `diff_artifact_id`, `raw_evidence_refs` | the StateGraph is a view over this |
+| `hypothesis` | derived | `hypothesis_id`, `run_id`, `llm_call_id`, `prompt_version`, `hypothesis_artifact_id`, `evidence_transition_ids`, `status` | never has a confidence column |
+| `experiment` | raw (frozen spec) | `experiment_id`, `hypothesis_id`, `spec_artifact_id`, `spec_hash`, `strata_allocation_version`, `target_n`, `stopping_rule` | the spec is hashed before the first attempt |
+| `trial` | raw (slot) | `trial_id`, `experiment_id`, `slot_index`, `stratum`, `probe_json`, `status` (PENDING/PASS/FAIL/NOT_RUN_FUTILITY/INFRA_EXHAUSTED) | exactly one row per slot; status is final once decided |
+| `trial_attempt` | raw | `attempt_id`, `trial_id`, `attempt_no` (1–3), `session_id`, `outcome` (PASS/FAIL/INVALID_INFRA), `infra_fault_code?`, `harness_log_artifact_id`, `started_at`, `ended_at` | append-only; only the last valid attempt decides the slot |
+| `verification` | raw | `verification_id`, `attempt_id`, `postcondition_json`, `pre_state_check` (was false before), `channel`, `strength` (same-channel / relaunch / independent), `verdict`, `evidence_refs`, `limitations` | internal behavioral verification only |
+| `capability` | derived | `capability_id`, `app_alias`, `name`, `gir_version`, `schema_artifact_id`, `status`, `stats_json` (N, successes, Wilson, per-stratum), `evidence_refs` | status comes only from trials |
+| `binding_version` | derived | `binding_version_id`, `capability_id`, `semantic_target`, `candidate_json` (neutral fields only), `source` (discovered/rebound), `proposed_by` (deterministic/semantic), `validated_by_experiment_id`, `valid_from`, `valid_to?` | never stores element handles |
+| `benchmark_adjudication` | adjudication DB only | `adjudication_id`, `publication_snapshot_hash`, `capability_id`, `oracle_family`, `trial_id?`, `capture_artifact_id`, `semantic_verdict`, `rubric_json`, `param_precision_json`, `param_recall_json`, `adjudicated_at` | lives in `adjudication/adjudication.sqlite` |
+| `publication_snapshot` *(added, needs approval)* | raw | `snapshot_id`, `run_id`, `capability_set_hash`, `created_at` | hashed before any adjudication (`BENCHMARKS.md` §13.1) |
+| `approval` *(added, needs approval)* | raw | `approval_id`, `requested_at`, `subject_json` (evidence-only description), `risk_class`, `decision`, `decided_by`, `decided_at`, `minutes_spent` | AGENTS gate records; feeds the H6 human-cost term |
+| `llm_call` *(added, needs approval)* | raw | `call_id`, `run_id`, `correlation_id`, `purpose` (semantic/router/baseline), `provider`, `model`, `prompt_version`, `evidence_hash`, `input_tokens`, `output_tokens`, `est_cost_usd`, `latency_ms`, `error_status`, `response_artifact_id` | required by ADR-013 |
+
+Entity tables (`entity`, `entity_reference`, `resolution_attempt`) wait for the approved Week 4 identity design.
+
+---
+
+## 4. Lineage
+
+```text
+run_manifest ─< session ─< raw_observation ─ platform_observation ─ observation_state ─ canonical_state
+                    └─< primitive_action ─ transition (from/to fingerprints + raw refs)
+hypothesis (evidence: transitions) ─< experiment ─< trial ─< trial_attempt ─< verification
+capability (from experiments) ─< binding_version
+publication_snapshot ──(hash)──► benchmark_adjudication   [separate DB; one-way]
+```
+
+---
+
+## 5. Migrations
+
+- Versioned forward migrations (`0001_…sql`), each with a reverse script where practical. A `schema_migrations` table records the applied version and checksum.
+- **Migration 0001 (Week 1)** creates only: `schema_migrations`, `run_manifest`, `session`, `raw_artifact`, `raw_observation`, `platform_observation`, `primitive_action`, `approval`, plus the append-only triggers.
+- Later migrations add tables in the week that first needs them: canonical_state/transition (Week 2); hypothesis/llm_call (Week 3); experiment/trial/trial_attempt/verification/capability/binding_version/publication_snapshot (Week 4); the adjudication DB (Week 4, harness).
+- Schema changes update this document and the manifest `database schema version` in the same commit.
+
+---
+
+## 6. Tests required when implemented
+
+- Immutability: `UPDATE`/`DELETE` on raw tables fails; artifact files are read-only after write.
+- Referential integrity: foreign keys on, with no orphan derived rows.
+- Idempotency: re-running an experiment with the same `trial_id` never creates a second slot. Replacement attempts are capped at 3.
+- Regeneration: re-deriving a PlatformObservation or CanonicalState from stored raw evidence gives the stored hash for the same generator version.
+- Separation: discovery packages cannot open the adjudication DB path (invariant test).
+- Migration round-trip on an empty DB and on a fixture DB.

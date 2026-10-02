@@ -1,0 +1,29 @@
+--- a/KICKOFF_PROMPT.md (v5 as supplied)
++++ b/KICKOFF_PROMPT.md (v5 + Week4/5 patch)
+@@ -1896,6 +1896,8 @@
+ ```
+ 
+ Demonstrate at least one capability that survives repeated fresh-state execution.
++
++Prove that the **internal** GIR runtime can execute a VERIFIED capability. The public `ghost call` CLI is not required in Week 4.
+ 
+ Entity identity begins only after basic creation-style capabilities work.
+ 
+@@ -1910,6 +1912,8 @@
+ ```
+ 
+ Run on the unseen pilot application.
++
++Expose the public `ghost call` CLI and use it to execute learned capabilities during the pilot.
+ 
+ No application-specific changes.
+ 
+@@ -1966,7 +1970,7 @@
+ 
+ ghost inspect <app>
+ 
+-ghost call <app> <capability> --arg value
++ghost call <app> <capability> --arg value      # public CLI from Week 5; Week 4 proves the internal runtime
+ 
+ ghost bench <suite>
+ ```
